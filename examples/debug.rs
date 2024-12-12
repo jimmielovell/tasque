@@ -50,7 +50,7 @@ async fn main() {
     let tasque: Tasque<CounterTask> = Tasque::new(
         Some(Duration::from_secs(5)),  // timeout
         Some(Duration::from_secs(10)), // max_delay
-        Some(Duration::from_secs(30)), // aging_duration
+        Some(Duration::from_secs(3)),  // aging_duration
         Some(1),                       // worker_count
         Some(100),                     // queue_capacity
     );

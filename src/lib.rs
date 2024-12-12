@@ -33,8 +33,8 @@ where
     T: Send + Sync + 'static,
 {
     queue: Arc<Mutex<PriorityQueue<T>>>,
-    metrics: Arc<Metrics>,
-    failed_tasqs: Arc<Mutex<VecDeque<TasqManager<T>>>>,
+    pub metrics: Arc<Metrics>,
+    pub failed_tasqs: Arc<Mutex<VecDeque<TasqManager<T>>>>,
     timeout: Duration,
     max_retry_delay: Duration,
     aging_duration: Duration,
@@ -131,32 +131,20 @@ where
         }
 
         // Spawn aging tasq
-        // let aging_tasq = self.spawn_aging_tasq();
-        // workers.push(aging_tasq);
+        let _ = spawn_aging_tasq(
+            Arc::clone(&self.queue),
+            Arc::clone(&self.metrics),
+            self.shutdown.clone().subscribe(),
+            self.aging_duration,
+        );
 
-        futures::future::join_all(handles).await;
+        // futures::future::join_all(handles).await;
     }
 
     pub async fn shutdown(&self) {
         tracing::info!("Initiating tasque shutdown...");
         // Send shutdown signal to all workers
         let _ = self.shutdown.send(());
-    }
-
-    async fn spawn_aging_tasq(&self) -> impl std::future::Future<Output = ()> {
-        let queue = Arc::clone(&self.queue);
-        let aging_duration = self.aging_duration;
-
-        async move {
-            loop {
-                tokio::time::sleep(aging_duration).await;
-
-                let queue = queue.lock().await;
-                // Implement aging logic here
-                // This would involve scanning the queue and upgrading tasq priorities
-                // based on their age
-            }
-        }
     }
 
     pub async fn get_metrics(&self) -> (usize, usize, usize) {
@@ -166,10 +154,6 @@ where
             self.metrics.tasks_in_progress.load(Ordering::SeqCst),
         )
     }
-
-    // pub async fn get_failed_tasqs(&self) -> Vec<TasqManager<T>> {
-    //     self.failed_tasqs.lock().await.iter().cloned().collect()
-    // }
 }
 
 fn spawn_worker<T>(
@@ -182,7 +166,10 @@ fn spawn_worker<T>(
     timeout: Duration,
     max_retry_delay: Duration,
     arg: Arc<T::A>,
-) -> JoinHandle<()> where T: Tasq + Send + Sync + 'static {
+) -> JoinHandle<()>
+where
+    T: Tasq + Send + Sync + 'static,
+{
     tokio::spawn(async move {
         loop {
             // First check for immediate tasks
@@ -193,8 +180,16 @@ fn spawn_worker<T>(
                 metrics.tasks_in_progress.fetch_add(1, Ordering::SeqCst);
 
                 let _permit = semaphore.acquire().await.unwrap();
-                
+
+                // Calculate tasq wait time
+                let wait_time = tasq_manager.created_at.elapsed();
+
+                let start_time = Instant::now();
                 let result = time::timeout(timeout, tasq_manager.tasq.run(&arg)).await;
+                let execution_time = start_time.elapsed();
+
+                // Record both wait and execution times
+                metrics.record_task_stats(tasq_manager.current_priority, wait_time, execution_time);
 
                 match result {
                     Ok(Ok(_)) => {
@@ -202,12 +197,8 @@ fn spawn_worker<T>(
                     }
                     _ => {
                         metrics.total_failed.fetch_add(1, Ordering::SeqCst);
-                        handle_failed_tasq(
-                            tasq_manager,
-                            &queue,
-                            &failed_tasqs,
-                            max_retry_delay,
-                        ).await;
+                        handle_failed_tasq(tasq_manager, &queue, &failed_tasqs, max_retry_delay)
+                            .await;
                     }
                 }
 
@@ -276,4 +267,38 @@ fn calculate_backoff(retry_count: u32, max_retry_delay: Duration) -> Duration {
     // Prevent synchronized retries by adding some randomness.
     let with_jitter = exp_backoff.mul_f64(1.0 + rand::thread_rng().gen_range(-0.1..0.1));
     std::cmp::min(with_jitter, max_retry_delay)
+}
+
+fn spawn_aging_tasq<T>(
+    queue: Arc<Mutex<PriorityQueue<T>>>,
+    metrics: Arc<Metrics>,
+    mut shutdown_rx: broadcast::Receiver<()>,
+    aging_duration: Duration,
+) -> JoinHandle<()>
+where
+    T: Tasq + Send + Sync + 'static,
+{
+    tokio::spawn(async move {
+        loop {
+            tokio::select! {
+                _ = shutdown_rx.recv() => {
+                    tracing::info!("Aging task received shutdown signal");
+                    break;
+                }
+                _ = tokio::time::sleep(aging_duration) => {
+                    let mut queue = queue.lock().await;
+
+                    // Update queue length metrics before trying promotions
+                    let (high, medium, low, _) = queue.get_queue_metrics();
+                    metrics.update_queue_lengths(high, medium, low);
+
+                    // Try to promote tasks based on current metrics
+                    let promoted = queue.try_promote_tasks(&metrics);
+                    if promoted > 0 {
+                        tracing::debug!("Promoted {} tasks", promoted);
+                    }
+                }
+            }
+        }
+    })
 }

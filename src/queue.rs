@@ -1,5 +1,7 @@
 use crate::manager::TasqManager;
+use crate::Metrics;
 use std::collections::{BTreeMap, BinaryHeap};
+use std::sync::atomic::Ordering;
 use std::time::Instant;
 
 /// Represents the priority of a `tasq` in the queue.
@@ -17,7 +19,7 @@ impl TasqPriority {
     ///
     /// # Returns
     /// The next higher priority. `Tasq`s with `High` priority remain unchanged.
-    pub fn upgrade(&self) -> Self {
+    pub fn promote(&self) -> Self {
         match self {
             TasqPriority::Low => TasqPriority::Medium,
             TasqPriority::Medium => TasqPriority::High,
@@ -37,10 +39,7 @@ pub struct PriorityQueue<T: Send + 'static> {
     capacity: usize,
 }
 
-impl<T> PriorityQueue<T>
-where
-    T: Send + 'static,
-{
+impl<T: Send + 'static> PriorityQueue<T> {
     pub fn new(capacity: usize) -> Self {
         Self {
             ready_tasqs: BinaryHeap::new(),
@@ -93,5 +92,97 @@ where
             return Some(Instant::now());
         }
         self.delayed_tasqs.keys().next().copied()
+    }
+}
+
+impl<T: Send + 'static> PriorityQueue<T> {
+    pub fn get_queue_metrics(&self) -> (usize, usize, usize, [Option<Instant>; 3]) {
+        let mut counts = [0, 0, 0];
+        let mut oldest = [None, None, None];
+
+        // Count ready tasks
+        for tasq_manager in &self.ready_tasqs {
+            match tasq_manager.current_priority {
+                TasqPriority::High => counts[0] += 1,
+                TasqPriority::Medium => counts[1] += 1,
+                TasqPriority::Low => counts[2] += 1,
+            }
+
+            // Track oldest task per priority
+            let idx = tasq_manager.current_priority as usize;
+            if oldest[idx].is_none() || oldest[idx].map_or(true, |t| tasq_manager.created_at < t) {
+                oldest[idx] = Some(tasq_manager.created_at);
+            }
+        }
+
+        (counts[0], counts[1], counts[2], oldest)
+    }
+
+    pub fn try_promote_tasks(&mut self, metrics: &Metrics) -> usize {
+        let hp_pressure = metrics.get_priority_pressure();
+        let mp_stress = metrics.get_stress_ratio(TasqPriority::Medium);
+        let lp_stress = metrics.get_stress_ratio(TasqPriority::Low);
+
+        // Calculate dynamic promotion batch size based on queue pressure
+        let hp_size = metrics
+            .high_priority_stats
+            .current_queue_size
+            .load(Ordering::Relaxed);
+        let promotion_batch_size = if hp_pressure > 1.0 {
+            // More conservative when HP queue is under pressure
+            1
+        } else {
+            // More aggressive when HP queue is healthy
+            // Use at most 10% of waiting tasks, minimum 1
+            (hp_size / 10).max(1)
+        };
+
+        // Check medium priority first
+        if mp_stress > (1.0 + hp_pressure) {
+            let promoted = self.promote_batch(TasqPriority::Medium, promotion_batch_size);
+            if promoted > 0 {
+                metrics.record_promotion(TasqPriority::Medium, promoted);
+                return promoted;
+            }
+        }
+
+        // Then check low priority with a higher threshold
+        if lp_stress > (2.0 + hp_pressure) {
+            let promoted = self.promote_batch(TasqPriority::Low, promotion_batch_size);
+            if promoted > 0 {
+                metrics.record_promotion(TasqPriority::Low, promoted);
+                return promoted;
+            }
+        }
+
+        0
+    }
+
+    fn promote_batch(&mut self, from: TasqPriority, count: usize) -> usize {
+        let mut promoted = 0;
+        let mut new_ready_queue = BinaryHeap::new();
+
+        let tasq_managers: Vec<_> = self.ready_tasqs.drain().collect();
+        let (to_promote, other_tasq_managers): (Vec<_>, Vec<_>) = tasq_managers
+            .into_iter()
+            .partition(|tm| promoted < count && tm.current_priority == from);
+
+        // Promote the selected tasks
+        for mut tasq_manager in to_promote {
+            // Update priority
+            match from {
+                TasqPriority::Medium => tasq_manager.current_priority = TasqPriority::High,
+                TasqPriority::Low => tasq_manager.current_priority = TasqPriority::Medium,
+                _ => {}
+            }
+            new_ready_queue.push(tasq_manager);
+            promoted += 1;
+        }
+
+        // Add remaining tasks
+        new_ready_queue.extend(other_tasq_managers);
+
+        self.ready_tasqs = new_ready_queue;
+        promoted
     }
 }
