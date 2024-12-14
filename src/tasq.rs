@@ -1,4 +1,5 @@
 use async_trait::async_trait;
+use std::fmt::Debug;
 
 /// Trait that defines a task to be executed by the `Tasque` queue.
 ///
@@ -14,7 +15,5 @@ pub trait Tasq {
     /// # Arguments
     /// * `arg` - A reference to an argument passed to the task.
     ///
-    /// # Returns
-    /// `Result<(), ()>` indicating success or failure.
     async fn run(&self, arg: &Self::A) -> Result<(), ()>;
 }

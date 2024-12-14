@@ -69,12 +69,12 @@ mod tests {
             .await
             .unwrap();
 
-        let handle = tokio::spawn({
+        let handle = {
             let tasque = tasque.clone();
-            async move {
-                tasque.run(Arc::new(())).await;
-            }
-        });
+            tokio::spawn(async move {
+                tasque.run(());
+            })
+        };
 
         sleep(Duration::from_millis(500)).await;
 
@@ -104,12 +104,12 @@ mod tests {
             .await
             .unwrap();
 
-        let handle = tokio::spawn({
+        let handle = {
             let tasque = tasque.clone();
-            async move {
-                tasque.run(Arc::new(())).await;
-            }
-        });
+            tokio::spawn(async move {
+                tasque.run(());
+            })
+        };
 
         // Wait for initial execution and retries
         sleep(Duration::from_secs(8)).await;
@@ -151,12 +151,12 @@ mod tests {
             .await
             .unwrap();
 
-        let handle = tokio::spawn({
+        let handle = {
             let tasque = tasque.clone();
-            async move {
-                tasque.run(Arc::new(())).await;
-            }
-        });
+            tokio::spawn(async move {
+                tasque.run(());
+            })
+        };
 
         sleep(Duration::from_millis(500)).await;
 
@@ -225,12 +225,12 @@ mod tests {
             .await
             .unwrap();
 
-        let handle = tokio::spawn({
+        let handle = {
             let tasque = tasque.clone();
-            async move {
-                tasque.run(Arc::new(())).await;
-            }
-        });
+            tokio::spawn(async move {
+                tasque.run(());
+            })
+        };
 
         sleep(Duration::from_millis(500)).await;
 
@@ -254,12 +254,12 @@ mod tests {
         );
 
         let context = Arc::new(());
-        let handle = tokio::spawn({
+        let handle = {
             let tasque = tasque.clone();
-            async move {
-                tasque.run(Arc::new(())).await;
-            }
-        });
+            tokio::spawn(async move {
+                tasque.run(());
+            })
+        };
 
         // Give it time to enter sleep state
         sleep(Duration::from_millis(100)).await;
@@ -279,7 +279,7 @@ mod tests {
         assert_eq!((processed, failed, in_progress), (1, 0, 0));
 
         tasque.shutdown().await;
-        handle.await.unwrap();
+        handle.abort();
     }
 
     #[tokio::test]
@@ -302,12 +302,12 @@ mod tests {
             .unwrap();
 
         let context = Arc::new(());
-        let handle = tokio::spawn({
+        let handle = {
             let tasque = tasque.clone();
-            async move {
-                tasque.run(Arc::new(())).await;
-            }
-        });
+            tokio::spawn(async move {
+                tasque.run(());
+            })
+        };
 
         // Verify task doesn't process immediately
         sleep(Duration::from_millis(100)).await;
@@ -318,7 +318,7 @@ mod tests {
         assert_eq!(task.get_execution_count(), 1);
 
         tasque.shutdown().await;
-        handle.await.unwrap();
+        handle.abort();
     }
 
     #[tokio::test]
@@ -344,12 +344,12 @@ mod tests {
             .unwrap();
 
         let context = Arc::new(());
-        let handle = tokio::spawn({
+        let handle = {
             let tasque = tasque.clone();
-            async move {
-                tasque.run(Arc::new(())).await;
-            }
-        });
+            tokio::spawn(async move {
+                tasque.run(());
+            })
+        };
 
         // Wait for tasks to start and verify concurrent execution
         sleep(Duration::from_millis(50)).await;
@@ -368,7 +368,7 @@ mod tests {
         assert!(time1.duration_since(time2) < Duration::from_millis(50));
 
         tasque.shutdown().await;
-        handle.await.unwrap();
+        handle.abort();
     }
 
     #[tokio::test]
@@ -388,18 +388,18 @@ mod tests {
             .unwrap();
 
         let context = Arc::new(());
-        let handle = tokio::spawn({
+        let handle = {
             let tasque = tasque.clone();
-            async move {
-                tasque.run(Arc::new(())).await;
-            }
-        });
+            tokio::spawn(async move {
+                tasque.run(());
+            })
+        };
 
         // Give task time to start
         sleep(Duration::from_millis(100)).await;
 
         tasque.shutdown().await;
-        handle.await.unwrap();
+        handle.abort();
 
         // Verify task completed despite shutdown
         assert_eq!(task.get_execution_count(), 1);

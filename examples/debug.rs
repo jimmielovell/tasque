@@ -1,5 +1,4 @@
 use async_trait::async_trait;
-use std::sync::Arc;
 use std::time::Duration;
 use tasque::{Tasq, TasqPriority, Tasque};
 use tokio::time::sleep;
@@ -67,7 +66,7 @@ async fn main() {
         processed, failed, in_progress
     );
 
-    tasque.run(Arc::new(context)).await;
+    tasque.run(context);
 
     // Give it time to enter sleep state
     sleep(Duration::from_millis(100)).await;

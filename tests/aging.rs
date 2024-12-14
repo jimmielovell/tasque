@@ -131,12 +131,12 @@ mod tests {
         }
 
         // Start the queue processing
-        let handle = tokio::spawn({
+        let handle = {
             let tasque = tasque.clone();
-            async move {
-                tasque.run(Arc::new(())).await;
-            }
-        });
+            tokio::spawn(async move {
+                tasque.run(());
+            })
+        };
 
         // Continuously add HP tasks
         for i in 8..18 {
@@ -218,12 +218,12 @@ mod tests {
         }
 
         // Start processing
-        let handle = tokio::spawn({
+        let handle = {
             let tasque = tasque.clone();
-            async move {
-                tasque.run(Arc::new(())).await;
-            }
-        });
+            tokio::spawn(async move {
+                tasque.run(());
+            })
+        };
 
         // Add HP tasks with varying execution times
         for i in 5..15 {
@@ -282,12 +282,12 @@ mod tests {
         }
 
         // Start processing
-        let handle = tokio::spawn({
+        let handle = {
             let tasque = tasque.clone();
-            async move {
-                tasque.run(Arc::new(())).await;
-            }
-        });
+            tokio::spawn(async move {
+                tasque.run(());
+            })
+        };
 
         // Add HP tasks periodically
         for i in 5..10 {
@@ -342,12 +342,12 @@ mod tests {
         }
 
         // Start processing
-        let handle = tokio::spawn({
+        let handle = {
             let tasque = tasque.clone();
-            async move {
-                tasque.run(Arc::new(())).await;
-            }
-        });
+            tokio::spawn(async move {
+                tasque.run(());
+            })
+        };
 
         // Continuously add HP tasks with varying execution times
         for i in 8..18 {
@@ -451,12 +451,12 @@ mod tests {
         }
 
         // Start processing
-        let handle = tokio::spawn({
+        let handle = {
             let tasque = tasque.clone();
-            async move {
-                tasque.run(Arc::new(())).await;
-            }
-        });
+            tokio::spawn(async move {
+                tasque.run(());
+            })
+        };
 
         // Add burst of HP tasks
         for i in 5..15 {

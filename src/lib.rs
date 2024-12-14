@@ -112,8 +112,9 @@ where
         Ok(())
     }
 
-    pub async fn run(&self, arg: Arc<T::A>) {
+    pub fn run(&self, arg: T::A) -> Vec<JoinHandle<()>> {
         let mut handles = Vec::with_capacity(self.worker_count);
+        let arg = Arc::new(arg);
 
         for _ in 0..self.worker_count {
             let handle = spawn_worker(
@@ -125,20 +126,21 @@ where
                 self.task_signal.1.clone(),
                 self.timeout,
                 self.max_retry_delay,
-                Arc::clone(&arg),
+                arg.clone(),
             );
             handles.push(handle);
         }
 
         // Spawn aging tasq
-        let _ = spawn_aging_tasq(
+        let handle = spawn_aging_tasq(
             Arc::clone(&self.queue),
             Arc::clone(&self.metrics),
             self.shutdown.clone().subscribe(),
             self.aging_duration,
         );
+        handles.push(handle);
 
-        // futures::future::join_all(handles).await;
+        handles
     }
 
     pub async fn shutdown(&self) {
