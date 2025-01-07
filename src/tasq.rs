@@ -1,5 +1,4 @@
 use async_trait::async_trait;
-use std::fmt::Debug;
 
 /// Trait that defines a task to be executed by the `Tasque` queue.
 ///

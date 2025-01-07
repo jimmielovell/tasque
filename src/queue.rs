@@ -28,7 +28,8 @@ impl TasqPriority {
     }
 }
 
-#[derive(Debug, Clone)]
+#[derive(thiserror::Error, Debug, Clone)]
+#[error("Queue is full")]
 pub struct QueueFullError;
 
 /// Priority queue implementation with separate ready and delayed tasqs

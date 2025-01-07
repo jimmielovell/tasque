@@ -1,6 +1,6 @@
 [package]
 name = "tasque"
-version = "0.1.0"
+version = "0.1.1"
 edition = "2021"
 
 [dependencies]
@@ -10,6 +10,7 @@ tokio = { version = "1.42.0", features = ["full"] }
 tracing = "0.1.41"
 log = "0.4.22"
 futures = "0.3.31"
+thiserror = "2.0.9"
 tracing-subscriber = "0.3.19"
 crossbeam = "0.8.4"
 
