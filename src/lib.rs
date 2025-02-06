@@ -267,7 +267,7 @@ fn calculate_backoff(retry_count: u32, max_retry_delay: Duration) -> Duration {
     let base = Duration::from_secs(1);
     let exp_backoff = base.mul_f64(2f64.powi(retry_count as i32));
     // Prevent synchronized retries by adding some randomness.
-    let with_jitter = exp_backoff.mul_f64(1.0 + rand::thread_rng().gen_range(-0.1..0.1));
+    let with_jitter = exp_backoff.mul_f64(1.0 + rand::rng().random_range(-0.1..0.1));
     std::cmp::min(with_jitter, max_retry_delay)
 }
 
