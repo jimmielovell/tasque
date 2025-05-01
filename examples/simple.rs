@@ -40,7 +40,7 @@ impl Tasq for CounterTask {
     }
 }
 
-#[tokio::main]
+#[tokio::main(flavor="current_thread")]
 async fn main() {
     // Initialize tracing for better debug output
     tracing_subscriber::fmt::init();

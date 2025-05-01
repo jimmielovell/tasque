@@ -8,7 +8,6 @@ mod tests {
     use tokio::sync::Mutex;
     use tokio::time::sleep;
 
-    // Mock task implementation
     #[derive(Clone, Debug)]
     struct MockTask {
         should_fail: bool,
