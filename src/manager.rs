@@ -12,9 +12,7 @@ pub struct TasqManager<T: Send + 'static> {
     pub current_priority: TasqPriority,
 }
 
-impl<T> Ord for TasqManager<T>
-where
-    T: Send + 'static,
+impl<T: Send + 'static> Ord for TasqManager<T>
 {
     fn cmp(&self, other: &Self) -> std::cmp::Ordering {
         // Order by priority first, then by next run time
@@ -24,22 +22,18 @@ where
     }
 }
 
-impl<T> PartialOrd for TasqManager<T>
-where
-    T: Send + 'static,
+impl<T: Send + 'static> PartialOrd for TasqManager<T>
 {
     fn partial_cmp(&self, other: &Self) -> Option<std::cmp::Ordering> {
         Some(self.cmp(other))
     }
 }
 
-impl<T> PartialEq for TasqManager<T>
-where
-    T: Send + 'static,
+impl<T: Send + 'static> PartialEq for TasqManager<T>
 {
     fn eq(&self, other: &Self) -> bool {
         self.priority == other.priority && self.next_run == other.next_run
     }
 }
 
-impl<T> Eq for TasqManager<T> where T: Send + 'static {}
+impl<T: Send + 'static> Eq for TasqManager<T>  {}

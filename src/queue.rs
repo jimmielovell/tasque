@@ -28,32 +28,21 @@ impl TasqPriority {
     }
 }
 
-#[derive(thiserror::Error, Debug, Clone)]
-#[error("Queue is full")]
-pub struct QueueFullError;
-
-/// Priority queue implementation with separate ready and delayed tasqs
 #[derive(Debug)]
 pub struct PriorityQueue<T: Send + 'static> {
     ready_tasqs: BinaryHeap<TasqManager<T>>,
     delayed_tasqs: BTreeMap<Instant, Vec<TasqManager<T>>>,
-    capacity: usize,
 }
 
 impl<T: Send + 'static> PriorityQueue<T> {
-    pub fn new(capacity: usize) -> Self {
+    pub fn new() -> Self {
         Self {
             ready_tasqs: BinaryHeap::new(),
             delayed_tasqs: BTreeMap::new(),
-            capacity,
         }
     }
 
-    pub fn push(&mut self, tasq_manager: TasqManager<T>) -> Result<(), QueueFullError> {
-        if self.len() >= self.capacity {
-            return Err(QueueFullError);
-        }
-
+    pub fn push(&mut self, tasq_manager: TasqManager<T>) {
         let now = Instant::now();
         if tasq_manager.next_run <= now {
             self.ready_tasqs.push(tasq_manager);
@@ -63,7 +52,6 @@ impl<T: Send + 'static> PriorityQueue<T> {
                 .or_default()
                 .push(tasq_manager);
         }
-        Ok(())
     }
 
     pub fn pop(&mut self) -> Option<TasqManager<T>> {
@@ -111,7 +99,7 @@ impl<T: Send + 'static> PriorityQueue<T> {
 
             // Track oldest task per priority
             let idx = tasq_manager.current_priority as usize;
-            if oldest[idx].is_none() || oldest[idx].map_or(true, |t| tasq_manager.created_at < t) {
+            if oldest[idx].is_none() || oldest[idx].is_none_or(|t| tasq_manager.created_at < t) {
                 oldest[idx] = Some(tasq_manager.created_at);
             }
         }

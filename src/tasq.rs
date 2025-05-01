@@ -3,7 +3,6 @@ use async_trait::async_trait;
 /// Trait that defines a task to be executed by the `Tasque` queue.
 ///
 /// Types implementing this trait can be added to the `Tasque` with a specified priority.
-/// The `run` method will be called asynchronously.
 #[async_trait]
 pub trait Tasq {
     /// Argument type passed to the task during execution.

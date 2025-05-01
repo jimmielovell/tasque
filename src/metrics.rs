@@ -2,7 +2,7 @@ use crate::TasqPriority;
 use std::sync::atomic::{AtomicU64, AtomicUsize, Ordering};
 use std::time::{Duration, Instant};
 
-#[derive(Debug)]
+#[derive(Debug, Default)]
 pub struct PriorityStats {
     pub avg_wait_time: AtomicU64, // in nanoseconds
     pub avg_exec_time: AtomicU64, // in nanoseconds
@@ -12,16 +12,6 @@ pub struct PriorityStats {
 }
 
 impl PriorityStats {
-    fn new() -> Self {
-        Self {
-            avg_wait_time: AtomicU64::new(0),
-            avg_exec_time: AtomicU64::new(0),
-            last_queue_size: AtomicUsize::new(0),
-            current_queue_size: AtomicUsize::new(0),
-            last_update_time: AtomicU64::new(Instant::now().elapsed().as_nanos() as u64),
-        }
-    }
-
     fn update_wait_time(&self, wait_time: Duration) {
         // Simple exponential moving average with alpha = 0.2
         const ALPHA: f64 = 0.2;
@@ -69,7 +59,7 @@ impl PriorityStats {
     }
 }
 
-#[derive(Debug)]
+#[derive(Debug, Default)]
 pub struct Metrics {
     // Existing metrics
     pub total_processed: AtomicUsize,
@@ -88,20 +78,6 @@ pub struct Metrics {
 }
 
 impl Metrics {
-    pub fn new() -> Self {
-        Self {
-            total_processed: AtomicUsize::new(0),
-            total_failed: AtomicUsize::new(0),
-            tasks_in_progress: AtomicUsize::new(0),
-            total_promotions: AtomicUsize::new(0),
-            medium_to_high_promotions: AtomicUsize::new(0),
-            low_to_medium_promotions: AtomicUsize::new(0),
-            high_priority_stats: PriorityStats::new(),
-            medium_priority_stats: PriorityStats::new(),
-            low_priority_stats: PriorityStats::new(),
-        }
-    }
-
     pub fn get_priority_pressure(&self) -> f64 {
         let growth_rate = self.high_priority_stats.get_queue_growth_rate();
         let exec_time = self.high_priority_stats.get_avg_exec_time();

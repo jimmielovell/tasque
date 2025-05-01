@@ -60,14 +60,12 @@ mod tests {
             Some(Duration::from_secs(30)),
             Some(Duration::from_secs(60)),
             Some(2),
-            Some(100),
         );
 
         let task = MockTask::new(false, Duration::from_millis(100));
         tasque
             .add(task.clone(), TasqPriority::Medium, 3, None)
-            .await
-            .unwrap();
+            .await;
 
         let handle = {
             let tasque = tasque.clone();
@@ -94,15 +92,13 @@ mod tests {
             Some(Duration::from_secs(30)),
             Some(Duration::from_secs(60)),
             Some(2),
-            Some(100),
         );
 
         let task = MockTask::new(true, Duration::from_millis(50));
         let max_retries = 2;
         tasque
             .add(task.clone(), TasqPriority::High, max_retries, None)
-            .await
-            .unwrap();
+            .await;
 
         let handle = {
             let tasque = tasque.clone();
@@ -130,7 +126,6 @@ mod tests {
             Some(Duration::from_secs(30)),
             Some(Duration::from_secs(60)),
             Some(1), // Single worker to ensure sequential processing
-            Some(100),
         );
 
         let high_priority = MockTask::new(false, Duration::from_millis(50));
@@ -140,16 +135,13 @@ mod tests {
         // Add tasks in reverse priority order
         tasque
             .add(low_priority.clone(), TasqPriority::Low, 0, None)
-            .await
-            .unwrap();
+            .await;
         tasque
             .add(medium_priority.clone(), TasqPriority::Medium, 0, None)
-            .await
-            .unwrap();
+            .await;
         tasque
             .add(high_priority.clone(), TasqPriority::High, 0, None)
-            .await
-            .unwrap();
+            .await;
 
         let handle = {
             let tasque = tasque.clone();
@@ -177,38 +169,6 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn test_queue_capacity() {
-        let capacity = 2;
-        let tasque = Tasque::new(
-            Some(Duration::from_secs(5)),
-            Some(Duration::from_secs(30)),
-            Some(Duration::from_secs(60)),
-            Some(1),
-            Some(capacity),
-        );
-
-        let task1 = MockTask::new(false, Duration::from_millis(100));
-        let task2 = MockTask::new(false, Duration::from_millis(100));
-        let task3 = MockTask::new(false, Duration::from_millis(100));
-
-        // First two tasks should succeed
-        assert!(tasque
-            .add(task1, TasqPriority::Medium, 0, None)
-            .await
-            .is_ok());
-        assert!(tasque
-            .add(task2, TasqPriority::Medium, 0, None)
-            .await
-            .is_ok());
-
-        // Third task should fail due to capacity
-        assert!(matches!(
-            tasque.add(task3, TasqPriority::Medium, 0, None).await,
-            Err(QueueFullError)
-        ));
-    }
-
-    #[tokio::test]
     async fn test_task_timeout() {
         let timeout = Duration::from_millis(100);
         let tasque = Tasque::new(
@@ -216,14 +176,12 @@ mod tests {
             Some(Duration::from_secs(30)),
             Some(Duration::from_secs(60)),
             Some(1),
-            Some(100),
         );
 
         let task = MockTask::new(false, Duration::from_millis(200)); // Task takes longer than timeout
         tasque
             .add(task.clone(), TasqPriority::Medium, 0, None)
-            .await
-            .unwrap();
+            .await;
 
         let handle = {
             let tasque = tasque.clone();
@@ -250,7 +208,6 @@ mod tests {
             Some(Duration::from_secs(30)),
             Some(Duration::from_secs(5)),
             Some(1),
-            Some(100),
         );
 
         let context = Arc::new(());
@@ -270,8 +227,7 @@ mod tests {
         let task = MockTask::new(false, Duration::from_millis(50));
         tasque
             .add(task.clone(), TasqPriority::Medium, 0, None)
-            .await
-            .unwrap();
+            .await;
 
         sleep(Duration::from_secs(5)).await;
 
@@ -289,7 +245,6 @@ mod tests {
             Some(Duration::from_secs(30)),
             Some(Duration::from_secs(60)),
             Some(1),
-            Some(100),
         );
 
         let task = MockTask::new(false, Duration::from_millis(50));
@@ -298,8 +253,7 @@ mod tests {
         let next_run = Instant::now() + Duration::from_millis(500);
         tasque
             .add(task.clone(), TasqPriority::Medium, 0, Some(next_run))
-            .await
-            .unwrap();
+            .await;
 
         let context = Arc::new(());
         let handle = {
@@ -328,7 +282,6 @@ mod tests {
             Some(Duration::from_secs(30)),
             Some(Duration::from_secs(60)),
             Some(2), // Two workers
-            Some(100),
         );
 
         let task1 = MockTask::new(false, Duration::from_millis(200));
@@ -336,12 +289,10 @@ mod tests {
 
         tasque
             .add(task1.clone(), TasqPriority::Medium, 0, None)
-            .await
-            .unwrap();
+            .await;
         tasque
             .add(task2.clone(), TasqPriority::Medium, 0, None)
-            .await
-            .unwrap();
+            .await;
 
         let context = Arc::new(());
         let handle = {
@@ -378,14 +329,12 @@ mod tests {
             Some(Duration::from_secs(30)),
             Some(Duration::from_secs(60)),
             Some(1),
-            Some(100),
         );
 
         let task = MockTask::new(false, Duration::from_millis(500));
         tasque
             .add(task.clone(), TasqPriority::Medium, 0, None)
-            .await
-            .unwrap();
+            .await;
 
         let context = Arc::new(());
         let handle = {

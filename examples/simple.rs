@@ -51,7 +51,6 @@ async fn main() {
         Some(Duration::from_secs(10)), // max_delay
         Some(Duration::from_secs(3)),  // aging_duration
         Some(1),                       // worker_count
-        Some(100),                     // queue_capacity
     );
 
     // Create context for tasks
@@ -74,8 +73,7 @@ async fn main() {
     for i in 0..5 {
         tasque
             .add(CounterTask { id: i }, TasqPriority::Medium, 3, None)
-            .await
-            .expect("Failed to add task");
+            .await;
         println!("Added task {}", i);
     }
 

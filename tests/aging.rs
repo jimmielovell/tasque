@@ -4,7 +4,7 @@ mod tests {
     use std::sync::atomic::Ordering;
     use std::sync::Arc;
     use std::time::{Duration, Instant};
-    use tasque::{QueueFullError, Tasq, TasqPriority, Tasque};
+    use tasque::{Tasq, TasqPriority, Tasque};
     use tokio::sync::Mutex;
     use tokio::time::sleep;
 
@@ -44,7 +44,6 @@ mod tests {
             Some(Duration::from_secs(30)),   // max_retry_delay
             Some(Duration::from_millis(20)), // aging_duration
             Some(2),                         // worker_count
-            Some(1000),                      // queue_capacity
         )
     }
 
@@ -54,7 +53,7 @@ mod tests {
         id: usize,
         priority: TasqPriority,
         execution_time: Duration,
-    ) -> Result<(), QueueFullError> {
+    ) {
         let task = TestTask {
             id,
             execution_time,
@@ -63,7 +62,7 @@ mod tests {
             original_priority: priority,
             metrics_map: Arc::new(Mutex::new(HashMap::new())),
         };
-        tasque.add(task, priority, 0, None).await
+        tasque.add(task, priority, 0, None).await;
     }
 
     // Task execution metrics for analysis
@@ -84,7 +83,7 @@ mod tests {
         priority: TasqPriority,
         execution_time: Duration,
         metrics_map: &Arc<Mutex<HashMap<usize, TaskMetrics>>>,
-    ) -> Result<(), QueueFullError> {
+    ) {
         let task = TestTask {
             id,
             execution_time,
@@ -108,7 +107,7 @@ mod tests {
             },
         );
 
-        tasque.add(task, priority, 0, None).await
+        tasque.add(task, priority, 0, None).await;
     }
 
     #[tokio::test]
@@ -118,16 +117,12 @@ mod tests {
         // Add initial mix of tasks
         // 5 LP tasks with 100ms execution time
         for i in 0..5 {
-            add_task(&tasque, i, TasqPriority::Low, Duration::from_millis(100))
-                .await
-                .unwrap();
+            add_task(&tasque, i, TasqPriority::Low, Duration::from_millis(100)).await;
         }
 
         // 3 MP tasks with 150ms execution time
         for i in 5..8 {
-            add_task(&tasque, i, TasqPriority::Medium, Duration::from_millis(150))
-                .await
-                .unwrap();
+            add_task(&tasque, i, TasqPriority::Medium, Duration::from_millis(150)).await;
         }
 
         // Start the queue processing
@@ -146,8 +141,7 @@ mod tests {
                 TasqPriority::High,
                 Duration::from_millis(50), // Quick tasks
             )
-            .await
-            .unwrap();
+            .await;
             sleep(Duration::from_millis(200)).await; // Add new HP task every 200ms
         }
 
@@ -212,9 +206,7 @@ mod tests {
         // Add initial tasks
         // 5 LP tasks with longer execution time
         for i in 0..5 {
-            add_task(&tasque, i, TasqPriority::Low, Duration::from_millis(200))
-                .await
-                .unwrap();
+            add_task(&tasque, i, TasqPriority::Low, Duration::from_millis(200)).await;
         }
 
         // Start processing
@@ -234,9 +226,7 @@ mod tests {
                 Duration::from_millis(300) // Slow
             };
 
-            add_task(&tasque, i, TasqPriority::High, exec_time)
-                .await
-                .unwrap();
+            add_task(&tasque, i, TasqPriority::High, exec_time).await;
             sleep(Duration::from_millis(150)).await;
         }
 
@@ -269,16 +259,12 @@ mod tests {
         // Add a mix of tasks
         // 3 LP long-running tasks
         for i in 0..3 {
-            add_task(&tasque, i, TasqPriority::Low, Duration::from_millis(400))
-                .await
-                .unwrap();
+            add_task(&tasque, i, TasqPriority::Low, Duration::from_millis(400)).await;
         }
 
         // 2 MP medium-length tasks
         for i in 3..5 {
-            add_task(&tasque, i, TasqPriority::Medium, Duration::from_millis(200))
-                .await
-                .unwrap();
+            add_task(&tasque, i, TasqPriority::Medium, Duration::from_millis(200)).await;
         }
 
         // Start processing
@@ -291,9 +277,7 @@ mod tests {
 
         // Add HP tasks periodically
         for i in 5..10 {
-            add_task(&tasque, i, TasqPriority::High, Duration::from_millis(100))
-                .await
-                .unwrap();
+            add_task(&tasque, i, TasqPriority::High, Duration::from_millis(100)).await;
             sleep(Duration::from_millis(300)).await;
         }
 
@@ -325,8 +309,7 @@ mod tests {
                 Duration::from_millis(100),
                 &metrics_map,
             )
-            .await
-            .unwrap();
+            .await;
         }
 
         for i in 5..8 {
@@ -337,8 +320,7 @@ mod tests {
                 Duration::from_millis(150),
                 &metrics_map,
             )
-            .await
-            .unwrap();
+            .await;
         }
 
         // Start processing
@@ -359,9 +341,7 @@ mod tests {
                 Duration::from_millis(250) // Slow
             };
 
-            add_task_with_tracking(&tasque, i, TasqPriority::High, exec_time, &metrics_map)
-                .await
-                .unwrap();
+            add_task_with_tracking(&tasque, i, TasqPriority::High, exec_time, &metrics_map).await;
 
             sleep(Duration::from_millis(200)).await;
         }
@@ -446,8 +426,7 @@ mod tests {
                 Duration::from_millis(100),
                 &metrics_map,
             )
-            .await
-            .unwrap();
+            .await;
         }
 
         // Start processing
@@ -467,8 +446,7 @@ mod tests {
                 Duration::from_millis(50),
                 &metrics_map,
             )
-            .await
-            .unwrap();
+            .await;
         }
 
         // Wait a bit
@@ -483,8 +461,7 @@ mod tests {
                 Duration::from_millis(75),
                 &metrics_map,
             )
-            .await
-            .unwrap();
+            .await;
         }
 
         // Wait for processing
