@@ -1,118 +1,55 @@
-# **tasque** 
+# tasque
 
-`tasque` is an asynchronous **priority-based task queue** for Rust applications, built using **Tokio**. Tasks can be prioritized as `High`, `Medium`, or `Low`, and will automatically age into higher priority queues to avoid starvation. Failed tasks can be retried with exponential backoff and jitter to ensure efficient handling.
-
----
-
-## **Features**
-
-- **Priority Queues**: Tasks are categorized as `High`, `Medium`, or `Low` priority.
-- **Automatic Aging**: Tasks upgrade to higher priority if they remain in the queue for too long.
-- **Retry Mechanism**: Failed tasks are retried with exponential backoff and jitter to avoid synchronized retries.
-- **Timeout Management**: Tasks are executed with a configurable timeout to prevent indefinite blocking.
-- **Concurrency-Safe**: Supports concurrent task production and consumption using Tokio primitives.
-
----
-
-## **Installation**
-
-Add `tasque` to your `Cargo.toml`:
+A small task queue on [Tokio](https://tokio.rs).
 
 ```toml
 [dependencies]
-tasque = "0.1.0"
+tasque = { git = "https://github.com/jimmielovell/tasque" }
 ```
 
-## Retry and Aging Strategies
+## Usage
 
-The Tasque queue implements retry and aging mechanisms to ensure robust task processing and fair task prioritization.
+```rust,ignore
+use serde::{Deserialize, Serialize};
+use tasque::{MemoryStore, Priority, Step, Tasque};
 
-### Exponential Backoff with Jitter
+#[derive(Clone, Serialize, Deserialize)]
+struct Email { address: String, body: String }
 
-The retry mechanism uses an exponential backoff algorithm with jitter to handle task failures:
+#[derive(Clone, Serialize, Deserialize)]
+struct Pdf { email_address: String, bytes: Vec<u8> }
 
-#### Backoff Calculation
-1. **Base Delay**: Starts with a 1-second base delay
-2. **Exponential Progression**: Doubles the delay with each retry
-3. **Maximum Delay Cap**: Prevents excessive wait times
-4. **Jitter**: Adds randomness to prevent synchronized retries
+let tasque = Tasque::new(MemoryStore::default(), clients)
+    .add("email", |ctx, Email { address, body }| async move {
+        ctx.postmark.send(&address, &body).await?;
+        Ok(())
+    })
+    .add("pdf", |_ctx, Pdf { email_address, bytes }| async move {
+        let body = extract_text(bytes)?;
+        Ok(Step::next(Email { address: email_address, body }))
+    })
+    .run()
+    .await?;
 
-#### Example Retry Sequence
-```
-Retry 0: 1s (base delay)
-Retry 1: 2s (2^1 * base delay)
-Retry 2: 4s (2^2 * base delay)
-Retry 3: 8s (2^3 * base delay)
-Max Delay: Capped at configured max_delay (default 5 minutes)
-```
-
-#### Jitter Mechanism
-- Randomly adjusts delay by ±10%
-- Prevents thundering herd problem
-- Distributes retry attempts
-
-### Retry Limitations
-- Maximum retry attempts configurable
-- Tracks retry count per task
-- Drops task after max retries exhausted
-
-## Aging Strategy
-
-### Priority Escalation
-
-Tasks can be automatically upgraded to higher priority queues based on waiting time.
-
-#### Key Characteristics
-- Prevents task starvation
-- Ensures long-waiting tasks get attention
-- Configurable aging duration
-
-#### Aging Rules
-- Low priority → Medium priority
-- Medium priority → High priority
-- High priority remains unchanged
-
-#### Aging Process
-1. Track task creation time
-2. Compare against configured aging duration
-3. Automatically upgrade priority
-4. Reset creation timestamp
-
-### Aging Example
-```
-Aging Duration: 5 minutes
-Low Priority Task Created → Waits 5+ minutes
-   ↓
-Automatically Promoted to Medium Priority
+tasque.queue(Email { address, body }, Priority::High, Some(3), false).await?;
 ```
 
-## Configuration Parameters
+- `ctx` derefs to the state given to `Tasque::new`. It also has `ctx.attempt()` and `ctx.queue(..)`.
+- Return `Ok(())` when done, or `Ok(Step::next(job))` to hand off to `job`'s handler.
+- The next job inherits priority, retries and persistence unless overridden: `Step::next(job).priority(..).retries(..).persist()`.
+- `retries: None` means 3.
+- `run` checks every `Step::next` type has a handler, then replays stored jobs.
 
-```rust
-Tasque::new(
-    timeout: Duration,           // Task execution timeout
-    max_delay: Duration,         // Maximum retry delay
-    aging_duration: Duration     // Time before priority upgrade
-)
-```
+## How jobs run
 
-## Best Practices
+- Each handler runs up to 4 jobs at once; the rest wait in line.
+- Higher priority goes first, but each level is only a 60s head start, so nothing starves.
+- Each attempt gets 30s. Failures, timeouts and panics retry after 1s, 2s, 4s… (±10%, max 5 min).
 
-1. Choose appropriate timeout values
-2. Set realistic max retry delays
-3. Configure aging duration based on system load
-4. Monitor and adjust strategies periodically
+## Persistence
 
-## Potential Use Cases
+Jobs queued with `persist: true` are saved to a `Store` until they finish, and `run` replays what's left after a restart.
 
-- Distributed task processing
-- Background job systems
-- Resilient microservices
-- Event-driven architectures
-
-## Limitations
-
-- Does not guarantee exactly-once processing
-- Potential for task duplication on persistent failures
-- Overhead of tracking and managing task metadata
-
+- Jobs run at least once, so persisted handlers should be safe to repeat.
+- Records are matched by handler name and stored as bincode, so renaming a handler or changing a job's fields strands old records.
+- For JSON instead: `default-features = false, features = ["json"]`.
