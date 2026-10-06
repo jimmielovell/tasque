@@ -15,18 +15,37 @@ readme = "README.md"
 async-trait = "0.1.92"
 rand = "0.10.3"
 serde = "1.0.219"
+moka = { version = "0.12.16", features = ["future"], optional = true }
 bincode = { version = "2.0.1", default-features = false, features = ["std", "serde"], optional = true }
 serde_json = { version = "1.0.151", optional = true }
 tokio = { version = "1.53.2", features = ["rt", "time"] }
 tracing = "0.1.44"
 
 [features]
-default = ["bincode"]
+default = ["bincode", "memory"]
 # Store persisted jobs as bincode (the default) or as JSON.
 bincode = ["dep:bincode"]
 json = ["dep:serde_json"]
+# MemoryStore.
+memory = ["dep:moka"]
 
 [dev-dependencies]
 serde = { version = "1.0.229", features = ["derive"] }
 tokio = { version = "1.53.2", features = ["macros", "rt-multi-thread", "test-util"] }
 tracing-subscriber = "0.3.23"
+
+[[example]]
+name = "simple"
+required-features = ["memory"]
+
+[[test]]
+name = "basic"
+required-features = ["memory"]
+
+[[test]]
+name = "priority"
+required-features = ["memory"]
+
+[[test]]
+name = "store"
+required-features = ["memory"]

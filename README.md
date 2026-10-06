@@ -52,4 +52,5 @@ Jobs queued with `persist: true` are saved to a `Store` until they finish, and `
 
 - Jobs run at least once, so persisted handlers should be safe to repeat.
 - Records are matched by handler name and stored as bincode, so renaming a handler or changing a job's fields strands old records.
-- For JSON instead: `default-features = false, features = ["json"]`.
+- For JSON instead: `default-features = false, features = ["json", "memory"]`.
+- `MemoryStore` is behind the default `memory` feature.

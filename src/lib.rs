@@ -8,7 +8,9 @@ mod tasque;
 
 pub use error::{BoxError, Error};
 pub use step::{IntoStep, Step};
-pub use store::{MemoryStore, Record, Store};
+#[cfg(feature = "memory")]
+pub use store::MemoryStore;
+pub use store::{Record, Store};
 pub use tasque::{Builder, Ctx, Tasque};
 
 /// Which jobs go first when a handler's slots are full.

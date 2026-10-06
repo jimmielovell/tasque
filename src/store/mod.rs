@@ -1,3 +1,4 @@
+#[cfg(feature = "memory")]
 mod memory;
 
 use crate::{BoxError, Priority};
@@ -5,6 +6,7 @@ use async_trait::async_trait;
 use std::sync::Arc;
 use std::time::SystemTime;
 
+#[cfg(feature = "memory")]
 pub use memory::MemoryStore;
 
 /// A persisted job.

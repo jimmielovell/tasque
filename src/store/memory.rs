@@ -1,30 +1,34 @@
 use crate::{BoxError, Record, Store};
 use async_trait::async_trait;
-use std::collections::HashMap;
-use std::sync::Mutex;
+use moka::future::Cache;
 
 /// Keeps jobs in memory. For tests and apps that never persist.
-#[derive(Default)]
 pub struct MemoryStore {
-    records: Mutex<HashMap<u128, Record>>,
+    // Unbounded: an eviction would silently drop a pending job.
+    records: Cache<u128, Record>,
+}
+
+impl Default for MemoryStore {
+    fn default() -> Self {
+        Self {
+            records: Cache::builder().build(),
+        }
+    }
 }
 
 #[async_trait]
 impl Store for MemoryStore {
     async fn save(&self, record: &Record) -> Result<(), BoxError> {
-        self.records
-            .lock()
-            .unwrap()
-            .insert(record.id, record.clone());
+        self.records.insert(record.id, record.clone()).await;
         Ok(())
     }
 
     async fn finish(&self, id: u128) -> Result<(), BoxError> {
-        self.records.lock().unwrap().remove(&id);
+        self.records.invalidate(&id).await;
         Ok(())
     }
 
     async fn pending(&self) -> Result<Vec<Record>, BoxError> {
-        Ok(self.records.lock().unwrap().values().cloned().collect())
+        Ok(self.records.iter().map(|(_, record)| record).collect())
     }
 }
