@@ -19,6 +19,8 @@ pub enum Error {
     Encode(BoxError),
     /// The store failed.
     Store(BoxError),
+    /// The `Tasque` is shutting down.
+    Stopped,
 }
 
 impl fmt::Display for Error {
@@ -33,6 +35,7 @@ impl fmt::Display for Error {
             }
             Error::Encode(err) => write!(f, "failed to serialize job: {err}"),
             Error::Store(err) => write!(f, "store failed: {err}"),
+            Error::Stopped => write!(f, "tasque is shutting down"),
         }
     }
 }

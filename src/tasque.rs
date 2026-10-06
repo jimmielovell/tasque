@@ -10,9 +10,10 @@ use std::future::Future;
 use std::marker::PhantomData;
 use std::ops::Deref;
 use std::pin::Pin;
-use std::sync::atomic::{AtomicU64, Ordering as AtomicOrdering};
-use std::sync::{Arc, Mutex};
+use std::sync::atomic::{AtomicU8, AtomicU64, Ordering as AtomicOrdering};
+use std::sync::{Arc, Mutex, Weak};
 use std::time::{Duration, SystemTime, UNIX_EPOCH};
+use tokio::sync::Notify;
 use tokio::time::Instant;
 
 /// How many jobs each handler runs at once.
@@ -24,6 +25,13 @@ const BASE_RETRY_DELAY: Duration = Duration::from_secs(1);
 const MAX_RETRY_DELAY: Duration = Duration::from_secs(300);
 /// The head start each priority level gets in line, so low priority work can't starve.
 const PRIORITY_STEP: Duration = Duration::from_secs(60);
+/// How often to claim jobs from processes that have stopped.
+const CLAIM_INTERVAL: Duration = Duration::from_secs(5);
+
+const RUNNING: u8 = 0;
+/// Shutting down: running attempts finish, nothing new starts.
+const DRAINING: u8 = 1;
+const STOPPED: u8 = 2;
 
 /// A job with its type erased.
 type Value = Box<dyn Any + Send>;
@@ -67,6 +75,44 @@ impl<S: Send + Sync + 'static> Tasque<S> {
         self.inner
             .queue(ty, Box::new(job), priority, retries, persist)
             .await
+    }
+
+    /// Stops taking jobs, waits for running attempts, then releases the store's
+    /// unfinished jobs to other processes.
+    ///
+    /// Jobs waiting in line or for a retry don't run here. Persisted ones are picked up
+    /// by another process; in-memory ones are dropped.
+    pub async fn shutdown(&self) -> Result<(), Error> {
+        let inner = &self.inner;
+        if inner.state.swap(DRAINING, AtomicOrdering::SeqCst) != RUNNING {
+            return Ok(());
+        }
+
+        loop {
+            let idle = inner.idle.notified();
+            tokio::pin!(idle);
+            idle.as_mut().enable();
+            if inner
+                .handlers
+                .values()
+                .all(|h| h.lane.lock().unwrap().running == 0)
+            {
+                break;
+            }
+            idle.await;
+        }
+
+        let dropped: usize = inner
+            .handlers
+            .values()
+            .map(|h| std::mem::take(&mut h.lane.lock().unwrap().waiting).len())
+            .sum();
+        if dropped > 0 {
+            tracing::info!("dropped {dropped} jobs waiting in line");
+        }
+
+        inner.state.store(STOPPED, AtomicOrdering::SeqCst);
+        inner.store.release().await.map_err(Error::Store)
     }
 }
 
@@ -133,21 +179,17 @@ impl<S: Send + Sync + 'static> Builder<S> {
         }
 
         let inner = Arc::new(Inner {
-            state: self.state,
+            ctx: self.state,
             store: self.store,
             handlers: self.handlers,
             seq: AtomicU64::new(0),
+            state: AtomicU8::new(RUNNING),
+            idle: Notify::new(),
         });
 
-        let records = inner.store.pending().await.map_err(Error::Store)?;
-        let mut jobs: Vec<Job> = records
-            .into_iter()
-            .filter_map(|record| inner.replay(record))
-            .collect();
-        jobs.sort();
-        for job in jobs {
-            inner.submit(job);
-        }
+        let claimed = inner.store.claim().await.map_err(Error::Store)?;
+        inner.replay(claimed);
+        tokio::spawn(claim_loop(Arc::downgrade(&inner)));
 
         Ok(Tasque { inner })
     }
@@ -163,7 +205,7 @@ impl<S> Deref for Ctx<S> {
     type Target = S;
 
     fn deref(&self) -> &S {
-        &self.inner.state
+        &self.inner.ctx
     }
 }
 
@@ -189,10 +231,15 @@ impl<S: Send + Sync + 'static> Ctx<S> {
 }
 
 struct Inner<S> {
-    state: S,
+    /// The state handlers reach through their `Ctx`.
+    ctx: S,
     store: Box<dyn Store>,
     handlers: HashMap<TypeId, Handler<S>>,
     seq: AtomicU64,
+    /// `RUNNING`, `DRAINING` or `STOPPED`.
+    state: AtomicU8,
+    /// Woken whenever a slot frees up, for `shutdown`.
+    idle: Notify,
 }
 
 struct Handler<S> {
@@ -266,6 +313,12 @@ impl<S: Send + Sync + 'static> Inner<S> {
             .get(&type_id)
             .ok_or(Error::Unregistered(type_name))?;
 
+        // While draining, a persisted job is saved for another process to run.
+        let state = self.state.load(AtomicOrdering::SeqCst);
+        if state == STOPPED || (state == DRAINING && !persist) {
+            return Err(Error::Stopped);
+        }
+
         let job = Job {
             id: rand::random(),
             type_id,
@@ -290,6 +343,10 @@ impl<S: Send + Sync + 'static> Inner<S> {
 
     /// Starts `job` if its handler has a free slot, or puts it in line.
     fn submit(self: &Arc<Self>, job: Job) {
+        if self.state.load(AtomicOrdering::SeqCst) != RUNNING {
+            return;
+        }
+
         let mut lane = self.handlers[&job.type_id].lane.lock().unwrap();
         if lane.running < SLOTS {
             lane.running += 1;
@@ -302,6 +359,14 @@ impl<S: Send + Sync + 'static> Inner<S> {
 
     async fn attempt(self: &Arc<Self>, mut job: Job) {
         let handler = &self.handlers[&job.type_id];
+        if job.persist && !self.store.owns(job.id) {
+            tracing::info!(
+                handler = handler.name,
+                "job {:032x} was claimed by another process; dropping it",
+                job.id
+            );
+            return;
+        }
         let ctx = Ctx {
             inner: self.clone(),
             attempt: job.attempt,
@@ -318,11 +383,14 @@ impl<S: Send + Sync + 'static> Inner<S> {
             }
         };
 
-        let job_id = job.id;
-        let persist_job = job.persist;
-
         match result {
-            Ok(next) => self.advance(job, next).await,
+            Ok(next) => {
+                let (id, persist) = (job.id, job.persist);
+                self.advance(job, next).await;
+                if persist {
+                    self.finish(id).await;
+                }
+            }
             Err(err) if job.attempt < job.retries => {
                 job.attempt += 1;
                 let delay = retry_delay(job.attempt);
@@ -344,11 +412,10 @@ impl<S: Send + Sync + 'static> Inner<S> {
                     "{err}; giving up after {} retries",
                     job.retries
                 );
+                if job.persist {
+                    self.fail(job.id, &err.to_string()).await;
+                }
             }
-        }
-
-        if persist_job {
-            self.finish(job_id).await;
         }
     }
 
@@ -379,8 +446,23 @@ impl<S: Send + Sync + 'static> Inner<S> {
         }
     }
 
+    async fn fail(&self, id: u128, error: &str) {
+        if let Err(err) = self.store.fail(id, error).await {
+            tracing::error!("store failed to mark job {id:032x} failed: {err}");
+        }
+    }
+
+    /// Runs claimed records, earliest in line first.
+    fn replay(self: &Arc<Self>, records: Vec<Record>) {
+        let mut jobs: Vec<Job> = records.into_iter().filter_map(|r| self.job(r)).collect();
+        jobs.sort();
+        for job in jobs {
+            self.submit(job);
+        }
+    }
+
     /// Turns a stored record back into a job, if a handler takes it.
-    fn replay(&self, record: Record) -> Option<Job> {
+    fn job(&self, record: Record) -> Option<Job> {
         let Some((&type_id, handler)) = self.handlers.iter().find(|(_, h)| h.name == record.name)
         else {
             tracing::warn!(
@@ -427,12 +509,35 @@ async fn work<S: Send + Sync + 'static>(inner: Arc<Inner<S>>, mut job: Job) {
         inner.attempt(job).await;
 
         let mut lane = inner.handlers[&type_id].lane.lock().unwrap();
-        match lane.waiting.pop() {
+        let next = match inner.state.load(AtomicOrdering::SeqCst) {
+            RUNNING => lane.waiting.pop(),
+            _ => None,
+        };
+        match next {
             Some(Reverse(next)) => job = next,
             None => {
                 lane.running -= 1;
+                drop(lane);
+                inner.idle.notify_waiters();
                 return;
             }
+        }
+    }
+}
+
+/// Claims jobs from stopped processes every `CLAIM_INTERVAL`, until shutdown.
+async fn claim_loop<S: Send + Sync + 'static>(inner: Weak<Inner<S>>) {
+    loop {
+        tokio::time::sleep(CLAIM_INTERVAL).await;
+        let Some(inner) = inner.upgrade() else {
+            return;
+        };
+        if inner.state.load(AtomicOrdering::SeqCst) != RUNNING {
+            return;
+        }
+        match inner.store.claim().await {
+            Ok(records) => inner.replay(records),
+            Err(err) => tracing::error!("store failed to claim jobs: {err}"),
         }
     }
 }

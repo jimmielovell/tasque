@@ -2,7 +2,7 @@ use serde::{Deserialize, Serialize};
 use std::sync::atomic::{AtomicU32, Ordering};
 use std::sync::{Arc, Mutex};
 use std::time::Duration;
-use tasque::{Error, MemoryStore, Priority, Step, Tasque};
+use tasque::{Error, MokaStore, Priority, Step, Tasque};
 use tokio::time::sleep;
 
 #[derive(Clone, Serialize, Deserialize)]
@@ -70,7 +70,7 @@ fn email(address: &str) -> Email {
 #[allow(unreachable_code)]
 async fn tasque() -> (Tasque<Arc<State>>, Arc<State>) {
     let state = Arc::new(State::default());
-    let t = Tasque::new(MemoryStore::default(), state.clone())
+    let t = Tasque::new(MokaStore::default(), state.clone())
         .add("email", |ctx, Email { address, body }| async move {
             ctx.sent.lock().unwrap().push((address, body));
             Ok(())
@@ -300,7 +300,7 @@ async fn a_handler_can_queue_more_jobs() {
     struct Fanout(Vec<String>);
 
     let state = Arc::new(State::default());
-    let t = Tasque::new(MemoryStore::default(), state.clone())
+    let t = Tasque::new(MokaStore::default(), state.clone())
         .add("email", |ctx, Email { address, body }| async move {
             ctx.sent.lock().unwrap().push((address, body));
             Ok(())
@@ -337,7 +337,7 @@ async fn queueing_a_type_without_a_handler_fails() {
 
 #[tokio::test]
 async fn start_fails_when_a_next_step_has_no_handler() {
-    let result = Tasque::new(MemoryStore::default(), ())
+    let result = Tasque::new(MokaStore::default(), ())
         .add(
             "pdf",
             |_ctx,
@@ -366,7 +366,7 @@ async fn start_fails_when_a_next_step_has_no_handler() {
 #[test]
 #[should_panic(expected = "a handler named \"email\" is already registered")]
 fn registering_a_name_twice_panics() {
-    let _ = Tasque::new(MemoryStore::default(), ())
+    let _ = Tasque::new(MokaStore::default(), ())
         .add("email", |_ctx, _: Email| async move { Ok(()) })
         .add("email", |_ctx, _: Pdf| async move { Ok(()) });
 }
@@ -374,7 +374,7 @@ fn registering_a_name_twice_panics() {
 #[test]
 #[should_panic(expected = "is already registered")]
 fn registering_a_type_twice_panics() {
-    let _ = Tasque::new(MemoryStore::default(), ())
+    let _ = Tasque::new(MokaStore::default(), ())
         .add("email", |_ctx, _: Email| async move { Ok(()) })
         .add("email_again", |_ctx, _: Email| async move { Ok(()) });
 }

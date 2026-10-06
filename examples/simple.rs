@@ -1,7 +1,7 @@
 use serde::{Deserialize, Serialize};
 use std::sync::atomic::{AtomicU32, Ordering};
 use std::time::Duration;
-use tasque::{MemoryStore, Priority, Step, Tasque};
+use tasque::{MokaStore, Priority, Step, Tasque};
 use tokio::time::sleep;
 
 #[derive(Clone, Debug, Serialize, Deserialize)]
@@ -40,7 +40,7 @@ async fn main() -> Result<(), tasque::Error> {
         sends: AtomicU32::new(0),
     };
 
-    let tasque = Tasque::new(MemoryStore::default(), mailer)
+    let tasque = Tasque::new(MokaStore::default(), mailer)
         .add("email", |ctx, Email { address, body }| async move {
             ctx.send(&address, &body).await?;
             Ok(())

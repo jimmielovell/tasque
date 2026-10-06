@@ -8,9 +8,11 @@ mod tasque;
 
 pub use error::{BoxError, Error};
 pub use step::{IntoStep, Step};
-#[cfg(feature = "memory")]
-pub use store::MemoryStore;
+#[cfg(feature = "moka-store")]
+pub use store::MokaStore;
 pub use store::{Record, Store};
+#[cfg(feature = "scylla-store")]
+pub use store::{ScyllaStore, ScyllaStoreBuilder};
 pub use tasque::{Builder, Ctx, Tasque};
 
 /// Which jobs go first when a handler's slots are full.

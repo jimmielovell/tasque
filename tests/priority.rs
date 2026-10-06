@@ -2,7 +2,7 @@ use serde::{Deserialize, Serialize};
 use std::sync::atomic::{AtomicUsize, Ordering};
 use std::sync::{Arc, Mutex};
 use std::time::Duration;
-use tasque::{MemoryStore, Priority, Step, Tasque};
+use tasque::{MokaStore, Priority, Step, Tasque};
 use tokio::time::{Instant, sleep};
 
 #[derive(Clone, Serialize, Deserialize)]
@@ -49,7 +49,7 @@ async fn tasque() -> (Tasque<Arc<State>>, Arc<State>) {
         email_after: Mutex::default(),
     });
 
-    let t = Tasque::new(MemoryStore::default(), state.clone())
+    let t = Tasque::new(MokaStore::default(), state.clone())
         .add("work", |ctx, Work { label, secs }| async move {
             let running = ctx.running.fetch_add(1, Ordering::SeqCst) + 1;
             ctx.most_running.fetch_max(running, Ordering::SeqCst);
