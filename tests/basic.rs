@@ -1,355 +1,380 @@
-#[cfg(test)]
-mod tests {
-    use async_trait::async_trait;
-    use std::sync::atomic::{AtomicU32, Ordering};
-    use std::sync::Arc;
-    use std::time::{Duration, Instant};
-    use tasque::{Tasq, TasqPriority, Tasque};
-    use tokio::sync::Mutex;
-    use tokio::time::sleep;
+use serde::{Deserialize, Serialize};
+use std::sync::atomic::{AtomicU32, Ordering};
+use std::sync::{Arc, Mutex};
+use std::time::Duration;
+use tasque::{Error, MokaStore, Priority, Step, Tasque};
+use tokio::time::sleep;
 
-    #[derive(Clone, Debug)]
-    struct MockTask {
-        should_fail: bool,
-        execution_time: Duration,
-        execution_count: Arc<AtomicU32>,
-        last_execution: Arc<Mutex<Option<Instant>>>,
+#[derive(Clone, Serialize, Deserialize)]
+struct Email {
+    address: String,
+    body: String,
+}
+
+#[derive(Clone, Serialize, Deserialize)]
+struct Pdf {
+    email_address: String,
+    bytes: Vec<u8>,
+}
+
+/// Fails until its `succeed_on` attempt.
+#[derive(Clone, Serialize, Deserialize)]
+struct Flaky {
+    succeed_on: u8,
+}
+
+/// Hands on a `Flaky` that never succeeds, with `retries` if given.
+#[derive(Clone, Serialize, Deserialize)]
+struct Relay {
+    retries: Option<u8>,
+}
+
+#[derive(Clone, Serialize, Deserialize)]
+struct Slow;
+
+#[derive(Clone, Serialize, Deserialize)]
+struct Panics;
+
+#[derive(Default)]
+struct State {
+    runs: AtomicU32,
+    attempts: Mutex<Vec<u8>>,
+    sent: Mutex<Vec<(String, String)>>,
+}
+
+impl State {
+    fn runs(&self) -> u32 {
+        self.runs.load(Ordering::SeqCst)
     }
 
-    impl MockTask {
-        fn new(should_fail: bool, execution_time: Duration) -> Self {
-            Self {
-                should_fail,
-                execution_time,
-                execution_count: Arc::new(AtomicU32::new(0)),
-                last_execution: Arc::new(Mutex::new(None)),
+    fn sent_to(&self) -> Vec<String> {
+        let mut sent: Vec<String> = self
+            .sent
+            .lock()
+            .unwrap()
+            .iter()
+            .map(|(a, _)| a.clone())
+            .collect();
+        sent.sort();
+        sent
+    }
+}
+
+fn email(address: &str) -> Email {
+    Email {
+        address: address.into(),
+        body: "hello".into(),
+    }
+}
+
+#[allow(unreachable_code)]
+async fn tasque() -> (Tasque<Arc<State>>, Arc<State>) {
+    let state = Arc::new(State::default());
+    let t = Tasque::new(MokaStore::default(), state.clone())
+        .add("email", |ctx, Email { address, body }| async move {
+            ctx.sent.lock().unwrap().push((address, body));
+            Ok(())
+        })
+        .add(
+            "pdf",
+            |_ctx,
+             Pdf {
+                 email_address,
+                 bytes,
+             }| async move {
+                let body = String::from_utf8(bytes)?;
+                Ok(Step::next(Email {
+                    address: email_address,
+                    body,
+                }))
+            },
+        )
+        .add("flaky", |ctx, Flaky { succeed_on }| async move {
+            ctx.runs.fetch_add(1, Ordering::SeqCst);
+            ctx.attempts.lock().unwrap().push(ctx.attempt());
+            if ctx.attempt() < succeed_on {
+                return Err("not yet".into());
             }
-        }
+            Ok(())
+        })
+        .add("relay", |_ctx, Relay { retries }| async move {
+            let next = Step::next(Flaky {
+                succeed_on: u8::MAX,
+            });
+            Ok(match retries {
+                Some(retries) => next.retries(retries),
+                None => next,
+            })
+        })
+        .add("slow", |ctx, Slow| async move {
+            sleep(Duration::from_secs(60)).await;
+            ctx.runs.fetch_add(1, Ordering::SeqCst);
+            Ok(())
+        })
+        .add("panics", |ctx, Panics| async move {
+            ctx.runs.fetch_add(1, Ordering::SeqCst);
+            panic!("handler panicked");
+            Ok(())
+        })
+        .run()
+        .await
+        .unwrap();
+    (t, state)
+}
 
-        fn get_execution_count(&self) -> u32 {
-            self.execution_count.load(Ordering::SeqCst)
-        }
+#[tokio::test(start_paused = true)]
+async fn runs_a_job_on_its_handler() {
+    let (t, state) = tasque().await;
+    t.queue(email("a@example.com"), Priority::Medium, None, false)
+        .await
+        .unwrap();
 
-        async fn get_last_execution(&self) -> Option<Instant> {
-            *self.last_execution.lock().await
-        }
+    sleep(Duration::from_millis(10)).await;
+    assert_eq!(
+        *state.sent.lock().unwrap(),
+        [("a@example.com".to_string(), "hello".to_string())]
+    );
+}
+
+#[tokio::test(start_paused = true)]
+async fn retries_a_failing_job_until_it_succeeds() {
+    let (t, state) = tasque().await;
+    t.queue(Flaky { succeed_on: 2 }, Priority::Medium, Some(3), false)
+        .await
+        .unwrap();
+
+    sleep(Duration::from_secs(60)).await;
+    assert_eq!(*state.attempts.lock().unwrap(), [0, 1, 2]);
+}
+
+#[tokio::test(start_paused = true)]
+async fn gives_up_after_its_retries() {
+    let (t, state) = tasque().await;
+    t.queue(
+        Flaky {
+            succeed_on: u8::MAX,
+        },
+        Priority::Medium,
+        Some(2),
+        false,
+    )
+    .await
+    .unwrap();
+
+    sleep(Duration::from_secs(600)).await;
+    assert_eq!(state.runs(), 3);
+}
+
+#[tokio::test(start_paused = true)]
+async fn no_retries_given_means_three() {
+    let (t, state) = tasque().await;
+    t.queue(
+        Flaky {
+            succeed_on: u8::MAX,
+        },
+        Priority::Medium,
+        None,
+        false,
+    )
+    .await
+    .unwrap();
+
+    sleep(Duration::from_secs(600)).await;
+    assert_eq!(state.runs(), 4);
+}
+
+#[tokio::test(start_paused = true)]
+async fn waits_longer_before_each_retry() {
+    let (t, state) = tasque().await;
+    t.queue(
+        Flaky {
+            succeed_on: u8::MAX,
+        },
+        Priority::Medium,
+        Some(3),
+        false,
+    )
+    .await
+    .unwrap();
+
+    // Retries come ~1s, ~2s and ~4s apart, each ±10%.
+    sleep(Duration::from_millis(500)).await;
+    assert_eq!(state.runs(), 1);
+    sleep(Duration::from_millis(1_000)).await;
+    assert_eq!(state.runs(), 2);
+    sleep(Duration::from_millis(2_500)).await;
+    assert_eq!(state.runs(), 3);
+    sleep(Duration::from_millis(5_000)).await;
+    assert_eq!(state.runs(), 4);
+}
+
+#[tokio::test(start_paused = true)]
+async fn a_job_running_past_the_timeout_is_stopped() {
+    let (t, state) = tasque().await;
+    t.queue(Slow, Priority::Medium, Some(0), false)
+        .await
+        .unwrap();
+
+    sleep(Duration::from_secs(120)).await;
+    assert_eq!(state.runs(), 0);
+}
+
+#[tokio::test(start_paused = true)]
+async fn a_panicking_handler_is_retried_and_frees_its_slot() {
+    let (t, state) = tasque().await;
+    for _ in 0..4 {
+        t.queue(Panics, Priority::Medium, Some(1), false)
+            .await
+            .unwrap();
     }
 
-    #[async_trait]
-    impl Tasq for MockTask {
-        type A = ();
+    sleep(Duration::from_secs(10)).await;
+    assert_eq!(state.runs(), 8);
 
-        async fn run(&self, _: &Self::A) -> Result<(), ()> {
-            self.execution_count.fetch_add(1, Ordering::SeqCst);
-            *self.last_execution.lock().await = Some(Instant::now());
-            sleep(self.execution_time).await;
+    // Had a panic leaked its slot, these would never run.
+    for _ in 0..4 {
+        t.queue(Panics, Priority::Medium, Some(0), false)
+            .await
+            .unwrap();
+    }
+    sleep(Duration::from_millis(10)).await;
+    assert_eq!(state.runs(), 12);
+}
 
-            if self.should_fail {
-                Err(())
-            } else {
-                Ok(())
+#[tokio::test(start_paused = true)]
+async fn next_runs_the_handler_for_its_type() {
+    let (t, state) = tasque().await;
+    let pdf = Pdf {
+        email_address: "b@example.com".into(),
+        bytes: b"from the pdf".to_vec(),
+    };
+    t.queue(pdf, Priority::Medium, None, false).await.unwrap();
+
+    sleep(Duration::from_millis(10)).await;
+    assert_eq!(
+        *state.sent.lock().unwrap(),
+        [("b@example.com".to_string(), "from the pdf".to_string())]
+    );
+}
+
+#[tokio::test(start_paused = true)]
+async fn the_next_step_inherits_retries() {
+    let (t, state) = tasque().await;
+    t.queue(Relay { retries: None }, Priority::Medium, Some(2), false)
+        .await
+        .unwrap();
+
+    sleep(Duration::from_secs(600)).await;
+    assert_eq!(state.runs(), 3);
+}
+
+#[tokio::test(start_paused = true)]
+async fn a_step_can_override_retries() {
+    let (t, state) = tasque().await;
+    t.queue(Relay { retries: Some(0) }, Priority::Medium, Some(2), false)
+        .await
+        .unwrap();
+
+    sleep(Duration::from_secs(600)).await;
+    assert_eq!(state.runs(), 1);
+}
+
+#[tokio::test(start_paused = true)]
+async fn a_failing_step_does_not_reach_the_next() {
+    let (t, state) = tasque().await;
+    let pdf = Pdf {
+        email_address: "b@example.com".into(),
+        bytes: vec![0xff, 0xfe],
+    };
+    t.queue(pdf, Priority::Medium, Some(0), false)
+        .await
+        .unwrap();
+
+    sleep(Duration::from_millis(10)).await;
+    assert!(state.sent.lock().unwrap().is_empty());
+}
+
+#[tokio::test(start_paused = true)]
+async fn a_handler_can_queue_more_jobs() {
+    #[derive(Clone, Serialize, Deserialize)]
+    struct Fanout(Vec<String>);
+
+    let state = Arc::new(State::default());
+    let t = Tasque::new(MokaStore::default(), state.clone())
+        .add("email", |ctx, Email { address, body }| async move {
+            ctx.sent.lock().unwrap().push((address, body));
+            Ok(())
+        })
+        .add("fanout", |ctx, Fanout(addresses)| async move {
+            for address in addresses {
+                ctx.queue(email(&address), Priority::Low, None, false)
+                    .await?;
             }
-        }
-    }
+            Ok(())
+        })
+        .run()
+        .await
+        .unwrap();
 
-    #[tokio::test]
-    async fn test_successful_task_execution() {
-        let tasque = Tasque::new(
-            Some(Duration::from_secs(5)),
-            Some(Duration::from_secs(30)),
-            Some(Duration::from_secs(60)),
-            Some(2),
-        );
+    let fanout = Fanout(vec!["a@example.com".into(), "b@example.com".into()]);
+    t.queue(fanout, Priority::Medium, None, false)
+        .await
+        .unwrap();
 
-        let task = MockTask::new(false, Duration::from_millis(100));
-        tasque
-            .add(task.clone(), TasqPriority::Medium, 3, None)
-            .await;
+    sleep(Duration::from_millis(10)).await;
+    assert_eq!(state.sent_to(), ["a@example.com", "b@example.com"]);
+}
 
-        let handle = {
-            let tasque = tasque.clone();
-            tokio::spawn(async move {
-                tasque.run(());
-            })
-        };
+#[tokio::test]
+async fn queueing_a_type_without_a_handler_fails() {
+    let (t, _) = tasque().await;
+    let err = t
+        .queue(42u32, Priority::Medium, None, false)
+        .await
+        .unwrap_err();
+    assert!(matches!(err, Error::Unregistered("u32")), "{err}");
+}
 
-        sleep(Duration::from_millis(500)).await;
+#[tokio::test]
+async fn start_fails_when_a_next_step_has_no_handler() {
+    let result = Tasque::new(MokaStore::default(), ())
+        .add(
+            "pdf",
+            |_ctx,
+             Pdf {
+                 email_address,
+                 bytes,
+             }| async move {
+                Ok(Step::next(Email {
+                    address: email_address,
+                    body: String::from_utf8(bytes)?,
+                }))
+            },
+        )
+        .run()
+        .await;
 
-        let (processed, failed, in_progress) = tasque.get_metrics().await;
-        assert_eq!(processed, 1);
-        assert_eq!(failed, 0);
-        assert_eq!(in_progress, 0);
-        assert_eq!(task.get_execution_count(), 1);
+    let Err(err) = result else {
+        panic!("start should fail");
+    };
+    assert!(
+        matches!(err, Error::MissingHandler { handler: "pdf", .. }),
+        "{err}"
+    );
+}
 
-        handle.abort();
-    }
+#[test]
+#[should_panic(expected = "a handler named \"email\" is already registered")]
+fn registering_a_name_twice_panics() {
+    let _ = Tasque::new(MokaStore::default(), ())
+        .add("email", |_ctx, _: Email| async move { Ok(()) })
+        .add("email", |_ctx, _: Pdf| async move { Ok(()) });
+}
 
-    #[tokio::test]
-    async fn test_task_retry_mechanism() {
-        let tasque = Tasque::new(
-            Some(Duration::from_secs(1)),
-            Some(Duration::from_secs(30)),
-            Some(Duration::from_secs(60)),
-            Some(2),
-        );
-
-        let task = MockTask::new(true, Duration::from_millis(50));
-        let max_retries = 2;
-        tasque
-            .add(task.clone(), TasqPriority::High, max_retries, None)
-            .await;
-
-        let handle = {
-            let tasque = tasque.clone();
-            tokio::spawn(async move {
-                tasque.run(());
-            })
-        };
-
-        // Wait for initial execution and retries
-        sleep(Duration::from_secs(8)).await;
-
-        let (processed, failed, in_progress) = tasque.get_metrics().await;
-        assert_eq!(processed, 0);
-        assert_eq!(failed, max_retries as usize + 1); // Initial attempt + retries
-        assert_eq!(in_progress, 0);
-        assert_eq!(task.get_execution_count(), max_retries as u32 + 1);
-
-        handle.abort();
-    }
-
-    #[tokio::test]
-    async fn test_priority_ordering() {
-        let tasque = Tasque::new(
-            Some(Duration::from_secs(5)),
-            Some(Duration::from_secs(30)),
-            Some(Duration::from_secs(60)),
-            Some(1), // Single worker to ensure sequential processing
-        );
-
-        let high_priority = MockTask::new(false, Duration::from_millis(50));
-        let medium_priority = MockTask::new(false, Duration::from_millis(50));
-        let low_priority = MockTask::new(false, Duration::from_millis(50));
-
-        // Add tasks in reverse priority order
-        tasque
-            .add(low_priority.clone(), TasqPriority::Low, 0, None)
-            .await;
-        tasque
-            .add(medium_priority.clone(), TasqPriority::Medium, 0, None)
-            .await;
-        tasque
-            .add(high_priority.clone(), TasqPriority::High, 0, None)
-            .await;
-
-        let handle = {
-            let tasque = tasque.clone();
-            tokio::spawn(async move {
-                tasque.run(());
-            })
-        };
-
-        sleep(Duration::from_millis(500)).await;
-
-        // Check execution order through timestamps
-        let high_time = high_priority.get_last_execution().await.unwrap();
-        let medium_time = medium_priority.get_last_execution().await.unwrap();
-        let low_time = low_priority.get_last_execution().await.unwrap();
-
-        assert!(high_time < medium_time);
-        assert!(medium_time < low_time);
-
-        let (processed, failed, in_progress) = tasque.get_metrics().await;
-        assert_eq!(processed, 3);
-        assert_eq!(failed, 0);
-        assert_eq!(in_progress, 0);
-
-        handle.abort();
-    }
-
-    #[tokio::test]
-    async fn test_task_timeout() {
-        let timeout = Duration::from_millis(100);
-        let tasque = Tasque::new(
-            Some(timeout),
-            Some(Duration::from_secs(30)),
-            Some(Duration::from_secs(60)),
-            Some(1),
-        );
-
-        let task = MockTask::new(false, Duration::from_millis(200)); // Task takes longer than timeout
-        tasque
-            .add(task.clone(), TasqPriority::Medium, 0, None)
-            .await;
-
-        let handle = {
-            let tasque = tasque.clone();
-            tokio::spawn(async move {
-                tasque.run(());
-            })
-        };
-
-        sleep(Duration::from_millis(500)).await;
-
-        let (processed, failed, in_progress) = tasque.get_metrics().await;
-        assert_eq!(processed, 0);
-        assert_eq!(failed, 1);
-        assert_eq!(in_progress, 0);
-        assert_eq!(task.get_execution_count(), 1);
-
-        handle.abort();
-    }
-
-    #[tokio::test]
-    async fn test_worker_sleep_and_wake() {
-        let tasque = Tasque::new(
-            Some(Duration::from_secs(1)),
-            Some(Duration::from_secs(30)),
-            Some(Duration::from_secs(5)),
-            Some(1),
-        );
-
-        let context = Arc::new(());
-        let handle = {
-            let tasque = tasque.clone();
-            tokio::spawn(async move {
-                tasque.run(());
-            })
-        };
-
-        // Give it time to enter sleep state
-        sleep(Duration::from_millis(100)).await;
-
-        let (processed, failed, in_progress) = tasque.get_metrics().await;
-        assert_eq!((processed, failed, in_progress), (0, 0, 0));
-
-        let task = MockTask::new(false, Duration::from_millis(50));
-        tasque
-            .add(task.clone(), TasqPriority::Medium, 0, None)
-            .await;
-
-        sleep(Duration::from_secs(5)).await;
-
-        let (processed, failed, in_progress) = tasque.get_metrics().await;
-        assert_eq!((processed, failed, in_progress), (1, 0, 0));
-
-        tasque.shutdown().await;
-        handle.abort();
-    }
-
-    #[tokio::test]
-    async fn test_delayed_task_processing() {
-        let tasque = Tasque::new(
-            Some(Duration::from_secs(1)),
-            Some(Duration::from_secs(30)),
-            Some(Duration::from_secs(60)),
-            Some(1),
-        );
-
-        let task = MockTask::new(false, Duration::from_millis(50));
-
-        // Add task with future next_run time
-        let next_run = Instant::now() + Duration::from_millis(500);
-        tasque
-            .add(task.clone(), TasqPriority::Medium, 0, Some(next_run))
-            .await;
-
-        let context = Arc::new(());
-        let handle = {
-            let tasque = tasque.clone();
-            tokio::spawn(async move {
-                tasque.run(());
-            })
-        };
-
-        // Verify task doesn't process immediately
-        sleep(Duration::from_millis(100)).await;
-        assert_eq!(task.get_execution_count(), 0);
-
-        // Wait for scheduled time and verify execution
-        sleep(Duration::from_millis(500)).await;
-        assert_eq!(task.get_execution_count(), 1);
-
-        tasque.shutdown().await;
-        handle.abort();
-    }
-
-    #[tokio::test]
-    async fn test_concurrent_processing() {
-        let tasque = Tasque::new(
-            Some(Duration::from_secs(1)),
-            Some(Duration::from_secs(30)),
-            Some(Duration::from_secs(60)),
-            Some(2), // Two workers
-        );
-
-        let task1 = MockTask::new(false, Duration::from_millis(200));
-        let task2 = MockTask::new(false, Duration::from_millis(200));
-
-        tasque
-            .add(task1.clone(), TasqPriority::Medium, 0, None)
-            .await;
-        tasque
-            .add(task2.clone(), TasqPriority::Medium, 0, None)
-            .await;
-
-        let context = Arc::new(());
-        let handle = {
-            let tasque = tasque.clone();
-            tokio::spawn(async move {
-                tasque.run(());
-            })
-        };
-
-        // Wait for tasks to start and verify concurrent execution
-        sleep(Duration::from_millis(50)).await;
-        let (_, _, in_progress) = tasque.get_metrics().await;
-        assert_eq!(in_progress, 2);
-
-        // Wait for completion
-        sleep(Duration::from_millis(300)).await;
-
-        let (processed, failed, in_progress) = tasque.get_metrics().await;
-        assert_eq!((processed, failed, in_progress), (2, 0, 0));
-
-        // Verify execution times are close (indicating concurrent execution)
-        let time1 = task1.get_last_execution().await.unwrap();
-        let time2 = task2.get_last_execution().await.unwrap();
-        assert!(time1.duration_since(time2) < Duration::from_millis(50));
-
-        tasque.shutdown().await;
-        handle.abort();
-    }
-
-    #[tokio::test]
-    async fn test_shutdown_with_pending_tasks() {
-        let tasque = Tasque::new(
-            Some(Duration::from_secs(1)),
-            Some(Duration::from_secs(30)),
-            Some(Duration::from_secs(60)),
-            Some(1),
-        );
-
-        let task = MockTask::new(false, Duration::from_millis(500));
-        tasque
-            .add(task.clone(), TasqPriority::Medium, 0, None)
-            .await;
-
-        let context = Arc::new(());
-        let handle = {
-            let tasque = tasque.clone();
-            tokio::spawn(async move {
-                tasque.run(());
-            })
-        };
-
-        // Give task time to start
-        sleep(Duration::from_millis(100)).await;
-
-        tasque.shutdown().await;
-        handle.abort();
-
-        // Verify task completed despite shutdown
-        assert_eq!(task.get_execution_count(), 1);
-    }
+#[test]
+#[should_panic(expected = "is already registered")]
+fn registering_a_type_twice_panics() {
+    let _ = Tasque::new(MokaStore::default(), ())
+        .add("email", |_ctx, _: Email| async move { Ok(()) })
+        .add("email_again", |_ctx, _: Email| async move { Ok(()) });
 }

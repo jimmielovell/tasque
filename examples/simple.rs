@@ -1,95 +1,80 @@
-use async_trait::async_trait;
+use serde::{Deserialize, Serialize};
+use std::sync::atomic::{AtomicU32, Ordering};
 use std::time::Duration;
-use tasque::{Tasq, TasqPriority, Tasque};
+use tasque::{MokaStore, Priority, Step, Tasque};
 use tokio::time::sleep;
 
-// Simple counter to track task execution
-static COUNTER: std::sync::atomic::AtomicUsize = std::sync::atomic::AtomicUsize::new(0);
-
-// A simple task that increments a counter and prints
-#[derive(Debug)]
-struct CounterTask {
-    id: usize,
+#[derive(Clone, Debug, Serialize, Deserialize)]
+struct Email {
+    address: String,
+    body: String,
 }
 
-// Simple context that will be passed to tasks
-#[derive(Debug)]
-struct Context {
-    name: String,
+#[derive(Clone, Debug, Serialize, Deserialize)]
+struct Pdf {
+    email_address: String,
+    bytes: Vec<u8>,
 }
 
-#[async_trait]
-impl Tasq for CounterTask {
-    type A = Context;
+/// Stands in for an email client that fails the first send.
+struct Mailer {
+    sends: AtomicU32,
+}
 
-    async fn run(&self, ctx: &Self::A) -> Result<(), ()> {
-        println!("Starting task {} with context {}", self.id, ctx.name);
-
-        // Simulate retry logic
-        if self.id == 3 {
-            return Err(());
+impl Mailer {
+    async fn send(&self, address: &str, body: &str) -> Result<(), String> {
+        if self.sends.fetch_add(1, Ordering::SeqCst) == 0 {
+            return Err("503 Service Unavailable".into());
         }
-
-        COUNTER.fetch_add(1, std::sync::atomic::Ordering::SeqCst);
-
-        // Simulate some work
         sleep(Duration::from_millis(100)).await;
-
-        println!("Completed task {}", self.id);
+        println!("sent to {address}: {body}");
         Ok(())
     }
 }
 
-#[tokio::main(flavor="current_thread")]
-async fn main() {
-    // Initialize tracing for better debug output
+#[tokio::main]
+async fn main() -> Result<(), tasque::Error> {
     tracing_subscriber::fmt::init();
 
-    // Create the task queue with debug-friendly settings
-    let tasque: Tasque<CounterTask> = Tasque::new(
-        Some(Duration::from_secs(5)),  // timeout
-        Some(Duration::from_secs(10)), // max_delay
-        Some(Duration::from_secs(3)),  // aging_duration
-        Some(1),                       // worker_count
-    );
-
-    // Create context for tasks
-    let context = Context {
-        name: "TestContext".to_string(),
+    let mailer = Mailer {
+        sends: AtomicU32::new(0),
     };
 
-    // Print initial metrics
-    let (processed, failed, in_progress) = tasque.get_metrics().await;
-    println!(
-        "Initial metrics - Processed: {}, Failed: {}, In Progress: {}",
-        processed, failed, in_progress
-    );
+    let tasque = Tasque::new(MokaStore::default(), mailer)
+        .add("email", |ctx, Email { address, body }| async move {
+            ctx.send(&address, &body).await?;
+            Ok(())
+        })
+        .add(
+            "pdf",
+            |_ctx,
+             Pdf {
+                 email_address,
+                 bytes,
+             }| async move {
+                let body = String::from_utf8(bytes)?;
+                Ok(Step::next(Email {
+                    address: email_address,
+                    body,
+                }))
+            },
+        )
+        .run()
+        .await?;
 
-    tasque.run(context);
+    let welcome = Email {
+        address: "new@example.com".into(),
+        body: "Hello buddy".into(),
+    };
+    tasque.queue(welcome, Priority::Low, Some(3), false).await?;
 
-    // Give it time to enter sleep state
-    sleep(Duration::from_millis(100)).await;
+    let pdf = Pdf {
+        email_address: "reader@example.com".into(),
+        bytes: b"the text inside the pdf".to_vec(),
+    };
+    tasque.queue(pdf, Priority::High, None, false).await?;
 
-    for i in 0..5 {
-        tasque
-            .add(CounterTask { id: i }, TasqPriority::Medium, 3, None)
-            .await;
-        println!("Added task {}", i);
-    }
-
-    sleep(Duration::from_secs(30)).await;
-    tasque.shutdown().await;
-
-    // Print final metrics
-    let (processed, failed, in_progress) = tasque.get_metrics().await;
-    println!(
-        "Final metrics - Processed: {}, Failed: {}, In Progress: {}",
-        processed, failed, in_progress
-    );
-
-    // Print final counter value
-    println!(
-        "Total tasks executed: {}",
-        COUNTER.load(std::sync::atomic::Ordering::SeqCst)
-    );
+    // The first send fails and is retried a second later.
+    sleep(Duration::from_secs(3)).await;
+    Ok(())
 }
