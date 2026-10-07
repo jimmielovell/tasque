@@ -91,8 +91,8 @@ async fn tasque() -> (Tasque<Arc<State>>, Arc<State>) {
         )
         .add("flaky", |ctx, Flaky { succeed_on }| async move {
             ctx.runs.fetch_add(1, Ordering::SeqCst);
-            ctx.attempts.lock().unwrap().push(ctx.attempt());
-            if ctx.attempt() < succeed_on {
+            ctx.attempts.lock().unwrap().push(ctx.attempt_count());
+            if ctx.attempt_count() < succeed_on {
                 return Err("not yet".into());
             }
             Ok(())
@@ -102,7 +102,7 @@ async fn tasque() -> (Tasque<Arc<State>>, Arc<State>) {
                 succeed_on: u8::MAX,
             });
             Ok(match retries {
-                Some(retries) => next.retries(retries),
+                Some(retries) => next.max_retries(retries),
                 None => next,
             })
         })

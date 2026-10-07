@@ -34,10 +34,10 @@ let tasque = Tasque::new(MokaStore::default(), clients)
 tasque.queue(Email { address, body }, Priority::High, Some(3), false).await?;
 ```
 
-- `ctx` derefs to the state given to `Tasque::new`. It also has `ctx.attempt()` and `ctx.queue(..)`.
+- `ctx` derefs to the state given to `Tasque::new`. It also has `ctx.attempt_count()` and `ctx.queue(..)`.
 - Return `Ok(())` when done, or `Ok(Step::next(job))` to hand off to `job`'s handler.
-- The next job inherits priority, retries and persistence unless overridden: `Step::next(job).priority(..).retries(..).persist()`.
-- `retries: None` means 3.
+- The next job inherits priority, max_retries and durability unless overridden: `Step::next(job).priority(..).max_retries(..).durable()`.
+- `max_retries: None` means 3.
 - `run` checks every `Step::next` type has a handler, then replays stored jobs.
 
 ## How jobs run
@@ -46,13 +46,13 @@ tasque.queue(Email { address, body }, Priority::High, Some(3), false).await?;
 - Higher priority goes first, but each level is only a 60s head start, so nothing starves.
 - Each attempt gets 30s. Failures, timeouts and panics retry after 1s, 2s, 4s… (±10%, max 5 min).
 
-## Persistence
+## Durability
 
-Jobs queued with `persist: true` are saved to a `Store` until they finish. When a process stops, through `tasque.shutdown()` or a crash, another claims its unfinished jobs.
+Jobs queued with `durable: true` are saved to a `Store` until they finish. When a process stops, through `tasque.shutdown()` or a crash, another reclaims its unfinished jobs.
 
 - Jobs run at least once, so persisted handlers should be safe to repeat.
-- Jobs that run out of retries are marked failed.
-- Records are matched by handler name and stored as bincode, so renaming a handler or changing a job's fields strands old records.
+- Jobs that run out of max_retries are marked failed.
+- Durable jobs are matched by handler name and stored as bincode, so renaming a handler or changing a job's fields strands old records.
 - For JSON instead: `default-features = false, features = ["json", "moka-store"]`.
 - `MokaStore` is behind the default `moka-store` feature, `ScyllaStore` behind `scylla-store`.
 

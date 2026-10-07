@@ -3,8 +3,8 @@ use serde::{Deserialize, Serialize};
 use std::sync::atomic::{AtomicU32, Ordering};
 use std::sync::{Arc, Mutex};
 use std::time::{Duration, SystemTime};
-use tasque::{BoxError, Error, MokaStore, Priority, Record, Step, Store, Tasque};
-use tokio::time::{Instant, sleep};
+use tasque::{BoxError, DurableJob, Error, JobId, MokaStore, Priority, Step, Store, Tasque};
+use tokio::time::{sleep, Instant};
 
 #[derive(Clone, Serialize, Deserialize)]
 struct Email {
@@ -72,7 +72,7 @@ async fn tasque(store: Arc<MokaStore>, emails: Emails) -> (Tasque<Arc<State>>, A
             Ok(Step::next(Email { address }))
         })
         .add("extract", |_ctx, Extract { address }| async move {
-            Ok(Step::next(Email { address }).persist())
+            Ok(Step::next(Email { address }).durable())
         })
         .add("fails", |_ctx, Fails| async move {
             Err::<(), BoxError>("always".into())
@@ -93,18 +93,18 @@ fn email(address: &str) -> Email {
 async fn unfinished(store: &MokaStore) -> Vec<String> {
     store.release().await.unwrap();
     let mut names: Vec<String> = store
-        .claim()
+        .reclaim_stale()
         .await
         .unwrap()
         .into_iter()
-        .map(|r| r.name)
+        .map(|r| r.handler_name)
         .collect();
     names.sort();
     names
 }
 
 #[tokio::test(start_paused = true)]
-async fn a_persisted_job_is_kept_until_it_finishes() {
+async fn a_durable_job_is_kept_until_it_finishes() {
     let store = Arc::new(MokaStore::default());
     let (t, _) = tasque(store.clone(), Emails::Take(10)).await;
     t.queue(email("a@example.com"), Priority::High, Some(5), true)
@@ -112,18 +112,18 @@ async fn a_persisted_job_is_kept_until_it_finishes() {
         .unwrap();
 
     store.release().await.unwrap();
-    let records = store.claim().await.unwrap();
+    let records = store.reclaim_stale().await.unwrap();
     assert_eq!(records.len(), 1);
-    assert_eq!(records[0].name, "email");
+    assert_eq!(records[0].handler_name, "email");
     assert_eq!(records[0].priority, Priority::High);
-    assert_eq!(records[0].retries, 5);
+    assert_eq!(records[0].max_retries, 5);
 
     sleep(Duration::from_secs(11)).await;
     assert!(unfinished(&store).await.is_empty());
 }
 
 #[tokio::test(start_paused = true)]
-async fn a_job_not_persisted_never_reaches_the_store() {
+async fn a_non_durable_job_never_reaches_the_store() {
     let store = Arc::new(MokaStore::default());
     let (t, state) = tasque(store.clone(), Emails::Take(10)).await;
     t.queue(email("a@example.com"), Priority::High, None, false)
@@ -224,12 +224,12 @@ async fn a_job_that_gives_up_leaves_the_store() {
 #[tokio::test(start_paused = true)]
 async fn a_job_with_no_handler_stays_in_the_store() {
     let store = Arc::new(MokaStore::default());
-    let orphan = Record {
-        id: 7,
-        name: "removed_handler".into(),
+    let orphan = DurableJob {
+        id: JobId::now_v7(),
+        handler_name: "removed_handler".into(),
         payload: Vec::new(),
         priority: Priority::Low,
-        retries: 0,
+        max_retries: 0,
         enqueued_at: SystemTime::now(),
     };
     store.save(&orphan).await.unwrap();
@@ -298,16 +298,16 @@ async fn queue_fails_when_the_store_does() {
 
     #[async_trait]
     impl Store for Down {
-        async fn save(&self, _: &Record) -> Result<(), BoxError> {
+        async fn save(&self, _: &DurableJob) -> Result<(), BoxError> {
             Err("connection refused".into())
         }
-        async fn finish(&self, _: u128) -> Result<(), BoxError> {
+        async fn finish(&self, _: JobId) -> Result<(), BoxError> {
             Err("connection refused".into())
         }
-        async fn fail(&self, _: u128, _: &str) -> Result<(), BoxError> {
+        async fn fail(&self, _: JobId, _: &str) -> Result<(), BoxError> {
             Err("connection refused".into())
         }
-        async fn claim(&self) -> Result<Vec<Record>, BoxError> {
+        async fn reclaim_stale(&self) -> Result<Vec<DurableJob>, BoxError> {
             Ok(Vec::new())
         }
         async fn release(&self) -> Result<(), BoxError> {
@@ -350,20 +350,20 @@ async fn a_next_step_the_store_refuses_does_not_hold_back_the_one_before() {
 
     #[async_trait]
     impl Store for NoEmails {
-        async fn save(&self, record: &Record) -> Result<(), BoxError> {
-            match record.name.as_str() {
+        async fn save(&self, record: &DurableJob) -> Result<(), BoxError> {
+            match record.handler_name.as_str() {
                 "email" => Err("disk full".into()),
                 _ => self.0.save(record).await,
             }
         }
-        async fn finish(&self, id: u128) -> Result<(), BoxError> {
+        async fn finish(&self, id: JobId) -> Result<(), BoxError> {
             self.0.finish(id).await
         }
-        async fn fail(&self, id: u128, error: &str) -> Result<(), BoxError> {
+        async fn fail(&self, id: JobId, error: &str) -> Result<(), BoxError> {
             self.0.fail(id, error).await
         }
-        async fn claim(&self) -> Result<Vec<Record>, BoxError> {
-            self.0.claim().await
+        async fn reclaim_stale(&self) -> Result<Vec<DurableJob>, BoxError> {
+            self.0.reclaim_stale().await
         }
         async fn release(&self) -> Result<(), BoxError> {
             self.0.release().await
@@ -403,29 +403,29 @@ async fn a_job_claimed_by_another_process_is_not_retried_here() {
     #[derive(Default)]
     struct Losable {
         store: MokaStore,
-        saved: Mutex<Vec<u128>>,
-        lost: Mutex<Vec<u128>>,
+        saved: Mutex<Vec<JobId>>,
+        lost: Mutex<Vec<JobId>>,
     }
 
     #[async_trait]
     impl Store for Losable {
-        async fn save(&self, record: &Record) -> Result<(), BoxError> {
+        async fn save(&self, record: &DurableJob) -> Result<(), BoxError> {
             self.saved.lock().unwrap().push(record.id);
             self.store.save(record).await
         }
-        async fn finish(&self, id: u128) -> Result<(), BoxError> {
+        async fn finish(&self, id: JobId) -> Result<(), BoxError> {
             self.store.finish(id).await
         }
-        async fn fail(&self, id: u128, error: &str) -> Result<(), BoxError> {
+        async fn fail(&self, id: JobId, error: &str) -> Result<(), BoxError> {
             self.store.fail(id, error).await
         }
-        async fn claim(&self) -> Result<Vec<Record>, BoxError> {
-            self.store.claim().await
+        async fn reclaim_stale(&self) -> Result<Vec<DurableJob>, BoxError> {
+            self.store.reclaim_stale().await
         }
         async fn release(&self) -> Result<(), BoxError> {
             self.store.release().await
         }
-        fn owns(&self, id: u128) -> bool {
+        fn is_owned(&self, id: JobId) -> bool {
             !self.lost.lock().unwrap().contains(&id)
         }
     }

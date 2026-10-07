@@ -10,10 +10,10 @@ pub use error::{BoxError, Error};
 pub use step::{IntoStep, Step};
 #[cfg(feature = "moka-store")]
 pub use store::MokaStore;
-pub use store::{Record, Store};
+pub use store::{DurableJob, Store};
 #[cfg(feature = "scylla-store")]
 pub use store::{ScyllaStore, ScyllaStoreBuilder};
-pub use tasque::{Builder, Ctx, Tasque};
+pub use tasque::{Builder, Context, JobId, Tasque};
 
 /// Which jobs go first when a handler's slots are full.
 #[derive(Clone, Copy, Debug, PartialEq, Eq, Hash, PartialOrd, Ord)]

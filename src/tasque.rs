@@ -1,42 +1,76 @@
 use crate::step::{Handoff, IntoStep};
-use crate::store::{Record, Store};
+use crate::store::{DurableJob, Store};
 use crate::{BoxError, Error, Priority};
-use serde::Serialize;
 use serde::de::DeserializeOwned;
-use std::any::{Any, TypeId, type_name};
+use serde::Serialize;
+use std::any::{type_name, Any, TypeId};
 use std::cmp::{Ordering, Reverse};
 use std::collections::{BinaryHeap, HashMap};
 use std::future::Future;
 use std::marker::PhantomData;
 use std::ops::Deref;
 use std::pin::Pin;
-use std::sync::atomic::{AtomicU8, AtomicU64, Ordering as AtomicOrdering};
+use std::sync::atomic::{AtomicU64, AtomicU8, Ordering as AtomicOrdering};
 use std::sync::{Arc, Mutex, Weak};
 use std::time::{Duration, SystemTime, UNIX_EPOCH};
 use tokio::sync::Notify;
 use tokio::time::Instant;
 
 /// How many jobs each handler runs at once.
-const SLOTS: usize = 4;
+const HANDLER_MAX_CONCURRENCY: usize = 4;
 /// How long one attempt may run before it fails.
-const TIMEOUT: Duration = Duration::from_secs(30);
-const DEFAULT_RETRIES: u8 = 3;
-const BASE_RETRY_DELAY: Duration = Duration::from_secs(1);
+const ATTEMPT_TIMEOUT: Duration = Duration::from_secs(30);
+const DEFAULT_MAX_RETRIES: u8 = 3;
+const INITIAL_RETRY_DELAY: Duration = Duration::from_secs(1);
 const MAX_RETRY_DELAY: Duration = Duration::from_secs(300);
 /// The head start each priority level gets in line, so low priority work can't starve.
-const PRIORITY_STEP: Duration = Duration::from_secs(60);
-/// How often to claim jobs from processes that have stopped.
-const CLAIM_INTERVAL: Duration = Duration::from_secs(5);
+const PRIORITY_AGING_STEP: Duration = Duration::from_secs(60);
+/// How often to reclaim jobs from processes that have stopped.
+const RECLAIM_INTERVAL: Duration = Duration::from_secs(5);
 
-const RUNNING: u8 = 0;
-/// Shutting down: running attempts finish, nothing new starts.
-const DRAINING: u8 = 1;
-const STOPPED: u8 = 2;
+#[derive(Clone, Copy, PartialEq, Eq)]
+#[repr(u8)]
+enum Lifecycle {
+    Running,
+    /// Finishing running jobs; only durable jobs may still be queued.
+    Draining,
+    Stopped,
+}
 
-/// A job with its type erased.
-type Value = Box<dyn Any + Send>;
-type Next = Option<Handoff>;
-type CallFuture = Pin<Box<dyn Future<Output = Result<Next, BoxError>> + Send>>;
+/// A `Lifecycle` that can be shared across threads.
+struct AtomicLifecycle(AtomicU8);
+
+impl AtomicLifecycle {
+    fn new(lifecycle: Lifecycle) -> Self {
+        Self(AtomicU8::new(lifecycle as u8))
+    }
+
+    fn load(&self) -> Lifecycle {
+        Self::decode(self.0.load(AtomicOrdering::SeqCst))
+    }
+
+    fn store(&self, lifecycle: Lifecycle) {
+        self.0.store(lifecycle as u8, AtomicOrdering::SeqCst);
+    }
+
+    fn swap(&self, lifecycle: Lifecycle) -> Lifecycle {
+        Self::decode(self.0.swap(lifecycle as u8, AtomicOrdering::SeqCst))
+    }
+
+    fn decode(value: u8) -> Lifecycle {
+        match value {
+            0 => Lifecycle::Running,
+            1 => Lifecycle::Draining,
+            _ => Lifecycle::Stopped,
+        }
+    }
+}
+
+/// A UUIDv7, so ids sort by when their job was queued.
+pub type JobId = uuid::Uuid;
+type ErasedJobPayload = Box<dyn Any + Send>;
+type NextStep = Option<Handoff>;
+type HandlerFuture = Pin<Box<dyn Future<Output = Result<NextStep, BoxError>> + Send>>;
 
 /// Runs each job on the handler registered for its type. Clones share the same handlers.
 pub struct Tasque<S> {
@@ -52,7 +86,7 @@ impl<S> Clone for Tasque<S> {
 }
 
 impl<S: Send + Sync + 'static> Tasque<S> {
-    /// Starts building a `Tasque`. Handlers reach `state` through their [`Ctx`].
+    /// Starts building a `Tasque`. Handlers reach `state` through their [`Context`].
     #[allow(clippy::new_ret_no_self)]
     pub fn new(store: impl Store, state: S) -> Builder<S> {
         Builder {
@@ -73,7 +107,7 @@ impl<S: Send + Sync + 'static> Tasque<S> {
     ) -> Result<(), Error> {
         let ty = (TypeId::of::<T>(), type_name::<T>());
         self.inner
-            .queue(ty, Box::new(job), priority, retries, persist)
+            .enqueue(ty, Box::new(job), priority, retries, persist)
             .await
     }
 
@@ -81,10 +115,10 @@ impl<S: Send + Sync + 'static> Tasque<S> {
     /// unfinished jobs to other processes.
     ///
     /// Jobs waiting in line or for a retry don't run here. Persisted ones are picked up
-    /// by another process; in-memory ones are dropped.
+    /// by another process; in-memory ones are discarded.
     pub async fn shutdown(&self) -> Result<(), Error> {
         let inner = &self.inner;
-        if inner.state.swap(DRAINING, AtomicOrdering::SeqCst) != RUNNING {
+        if inner.lifecycle.swap(Lifecycle::Draining) != Lifecycle::Running {
             return Ok(());
         }
 
@@ -92,26 +126,28 @@ impl<S: Send + Sync + 'static> Tasque<S> {
             let idle = inner.idle.notified();
             tokio::pin!(idle);
             idle.as_mut().enable();
+
             if inner
                 .handlers
                 .values()
-                .all(|h| h.lane.lock().unwrap().running == 0)
+                .all(|h| h.queue.lock().unwrap().running == 0)
             {
                 break;
             }
+
             idle.await;
         }
 
-        let dropped: usize = inner
+        let discarded: usize = inner
             .handlers
             .values()
-            .map(|h| std::mem::take(&mut h.lane.lock().unwrap().waiting).len())
+            .map(|h| std::mem::take(&mut h.queue.lock().unwrap().pending).len())
             .sum();
-        if dropped > 0 {
-            tracing::info!("dropped {dropped} jobs waiting in line");
+        if discarded > 0 {
+            tracing::info!("discarded {discarded} non-durable jobs waiting in line");
         }
 
-        inner.state.store(STOPPED, AtomicOrdering::SeqCst);
+        inner.lifecycle.store(Lifecycle::Stopped);
         inner.store.release().await.map_err(Error::Store)
     }
 }
@@ -134,7 +170,7 @@ impl<S: Send + Sync + 'static> Builder<S> {
     pub fn add<I, F, Fut, O>(mut self, name: &'static str, handler: F) -> Self
     where
         I: Clone + Serialize + DeserializeOwned + Send + 'static,
-        F: Fn(Ctx<S>, I) -> Fut + Send + Sync + 'static,
+        F: Fn(Context<S>, I) -> Fut + Send + Sync + 'static,
         Fut: Future<Output = Result<O, BoxError>> + Send + 'static,
         O: IntoStep,
     {
@@ -142,6 +178,7 @@ impl<S: Send + Sync + 'static> Builder<S> {
             self.handlers.values().all(|h| h.name != name),
             "tasque: a handler named {name:?} is already registered"
         );
+
         assert!(
             !self.handlers.contains_key(&TypeId::of::<I>()),
             "tasque: a handler for {} is already registered",
@@ -152,12 +189,12 @@ impl<S: Send + Sync + 'static> Builder<S> {
             TypeId::of::<I>(),
             Handler {
                 name,
-                call: Box::new(FnCall::<I, F, O> {
+                invoker: Box::new(FunctionInvoker::<I, F, O> {
                     f: handler,
                     _types: PhantomData,
                 }),
-                next: O::next_type(),
-                lane: Mutex::default(),
+                next_handler: O::next_handler(),
+                queue: Mutex::default(),
             },
         );
 
@@ -168,11 +205,11 @@ impl<S: Send + Sync + 'static> Builder<S> {
     /// unfinished jobs from the store.
     pub async fn run(self) -> Result<Tasque<S>, Error> {
         for handler in self.handlers.values() {
-            if let Some((next, next_name)) = handler.next {
-                if !self.handlers.contains_key(&next) {
+            if let Some((handler_type_id, handler_name)) = handler.next_handler {
+                if !self.handlers.contains_key(&handler_type_id) {
                     return Err(Error::MissingHandler {
                         handler: handler.name,
-                        next: next_name,
+                        next: handler_name,
                     });
                 }
             }
@@ -182,26 +219,26 @@ impl<S: Send + Sync + 'static> Builder<S> {
             ctx: self.state,
             store: self.store,
             handlers: self.handlers,
-            seq: AtomicU64::new(0),
-            state: AtomicU8::new(RUNNING),
+            sequence: AtomicU64::new(0),
+            lifecycle: AtomicLifecycle::new(Lifecycle::Running),
             idle: Notify::new(),
         });
 
-        let claimed = inner.store.claim().await.map_err(Error::Store)?;
-        inner.replay(claimed);
-        tokio::spawn(claim_loop(Arc::downgrade(&inner)));
+        let recovered = inner.store.reclaim_stale().await.map_err(Error::Store)?;
+        inner.restore_jobs(recovered);
+        tokio::spawn(reclaim_loop(Arc::downgrade(&inner)));
 
         Ok(Tasque { inner })
     }
 }
 
 /// Passed to each handler run. Derefs to the state given to [`Tasque::new`].
-pub struct Ctx<S> {
+pub struct Context<S> {
     inner: Arc<Inner<S>>,
-    attempt: u8,
+    attempt_count: u8,
 }
 
-impl<S> Deref for Ctx<S> {
+impl<S> Deref for Context<S> {
     type Target = S;
 
     fn deref(&self) -> &S {
@@ -209,10 +246,10 @@ impl<S> Deref for Ctx<S> {
     }
 }
 
-impl<S: Send + Sync + 'static> Ctx<S> {
+impl<S: Send + Sync + 'static> Context<S> {
     /// 0 on the first run, 1 on the first retry, and so on.
-    pub fn attempt(&self) -> u8 {
-        self.attempt
+    pub fn attempt_count(&self) -> u8 {
+        self.attempt_count
     }
 
     /// Queues another job, as [`Tasque::queue`] does.
@@ -220,67 +257,66 @@ impl<S: Send + Sync + 'static> Ctx<S> {
         &self,
         job: T,
         priority: Priority,
-        retries: Option<u8>,
-        persist: bool,
+        max_retries: Option<u8>,
+        durable: bool,
     ) -> Result<(), Error> {
         let ty = (TypeId::of::<T>(), type_name::<T>());
         self.inner
-            .queue(ty, Box::new(job), priority, retries, persist)
+            .enqueue(ty, Box::new(job), priority, max_retries, durable)
             .await
     }
 }
 
 struct Inner<S> {
-    /// The state handlers reach through their `Ctx`.
+    /// The state handlers reach through their `Context`.
     ctx: S,
     store: Box<dyn Store>,
     handlers: HashMap<TypeId, Handler<S>>,
-    seq: AtomicU64,
-    /// `RUNNING`, `DRAINING` or `STOPPED`.
-    state: AtomicU8,
+    sequence: AtomicU64,
+    lifecycle: AtomicLifecycle,
     /// Woken whenever a slot frees up, for `shutdown`.
     idle: Notify,
 }
 
 struct Handler<S> {
     name: &'static str,
-    call: Box<dyn Call<S>>,
-    next: Option<(TypeId, &'static str)>,
-    lane: Mutex<Lane>,
+    invoker: Box<dyn Invoker<S>>,
+    next_handler: Option<(TypeId, &'static str)>,
+    queue: Mutex<HandlerQueue>,
 }
 
 /// A handler's running count and the line of jobs waiting for a slot.
 #[derive(Default)]
-struct Lane {
+struct HandlerQueue {
     running: usize,
     /// `Reverse` so the heap pops the earliest job first.
-    waiting: BinaryHeap<Reverse<Job>>,
+    pending: BinaryHeap<Reverse<Job>>,
 }
 
 struct Job {
-    id: u128,
+    id: JobId,
     type_id: TypeId,
-    value: Value,
+    payload: ErasedJobPayload,
     priority: Priority,
-    retries: u8,
+    max_retries: u8,
     attempt: u8,
-    persist: bool,
+    durable: bool,
     enqueued_at: Instant,
-    seq: u64,
+    sequence: u64,
 }
 
 impl Job {
     /// Its place in line. Lower priority counts as arriving later.
-    fn rank(&self) -> Instant {
-        let behind = Priority::High as u32 - self.priority as u32;
-        self.enqueued_at + PRIORITY_STEP * behind
+    fn queue_position(&self) -> Instant {
+        let priority_offset = Priority::High as u32 - self.priority as u32;
+        self.enqueued_at + PRIORITY_AGING_STEP * priority_offset
     }
 }
 
 /// Ordered by place in line, not identity.
 impl Ord for Job {
     fn cmp(&self, other: &Self) -> Ordering {
-        (self.rank(), self.seq).cmp(&(other.rank(), other.seq))
+        (self.queue_position(), self.sequence).cmp(&(other.queue_position(), other.sequence))
     }
 }
 
@@ -299,14 +335,13 @@ impl PartialEq for Job {
 impl Eq for Job {}
 
 impl<S: Send + Sync + 'static> Inner<S> {
-    /// Queues an erased job. A job the store can't save isn't run.
-    async fn queue(
+    async fn enqueue(
         self: &Arc<Self>,
         (type_id, type_name): (TypeId, &'static str),
-        value: Value,
+        payload: ErasedJobPayload,
         priority: Priority,
-        retries: Option<u8>,
-        persist: bool,
+        max_retries: Option<u8>,
+        durable: bool,
     ) -> Result<(), Error> {
         let handler = self
             .handlers
@@ -314,25 +349,25 @@ impl<S: Send + Sync + 'static> Inner<S> {
             .ok_or(Error::Unregistered(type_name))?;
 
         // While draining, a persisted job is saved for another process to run.
-        let state = self.state.load(AtomicOrdering::SeqCst);
-        if state == STOPPED || (state == DRAINING && !persist) {
+        let lifecycle = self.lifecycle.load();
+        if lifecycle == Lifecycle::Stopped || (lifecycle == Lifecycle::Draining && !durable) {
             return Err(Error::Stopped);
         }
 
         let job = Job {
-            id: rand::random(),
+            id: JobId::now_v7(),
             type_id,
-            value,
+            payload,
             priority,
-            retries: retries.unwrap_or(DEFAULT_RETRIES),
+            max_retries: max_retries.unwrap_or(DEFAULT_MAX_RETRIES),
             attempt: 0,
-            persist,
+            durable,
             enqueued_at: Instant::now(),
-            seq: self.seq.fetch_add(1, AtomicOrdering::Relaxed),
+            sequence: self.sequence.fetch_add(1, AtomicOrdering::Relaxed),
         };
 
-        if persist {
-            let record = record(handler, &job).map_err(Error::Encode)?;
+        if durable {
+            let record = to_record(handler, &job).map_err(Error::Encode)?;
             self.store.save(&record).await.map_err(Error::Store)?;
         }
 
@@ -343,23 +378,25 @@ impl<S: Send + Sync + 'static> Inner<S> {
 
     /// Starts `job` if its handler has a free slot, or puts it in line.
     fn submit(self: &Arc<Self>, job: Job) {
-        if self.state.load(AtomicOrdering::SeqCst) != RUNNING {
+        if self.lifecycle.load() != Lifecycle::Running {
             return;
         }
 
-        let mut lane = self.handlers[&job.type_id].lane.lock().unwrap();
-        if lane.running < SLOTS {
-            lane.running += 1;
-            drop(lane);
-            tokio::spawn(work(self.clone(), job));
+        let mut handler_queue = self.handlers[&job.type_id].queue.lock().unwrap();
+        if handler_queue.running < HANDLER_MAX_CONCURRENCY {
+            handler_queue.running += 1;
+            drop(handler_queue);
+            
+            tokio::spawn(run_handler_slot(self.clone(), job));
         } else {
-            lane.waiting.push(Reverse(job));
+            handler_queue.pending.push(Reverse(job));
         }
     }
 
-    async fn attempt(self: &Arc<Self>, mut job: Job) {
+    async fn run_attempt(self: &Arc<Self>, mut job: Job) {
         let handler = &self.handlers[&job.type_id];
-        if job.persist && !self.store.owns(job.id) {
+
+        if job.durable && !self.store.is_owned(job.id) {
             tracing::info!(
                 handler = handler.name,
                 "job {:032x} was claimed by another process; dropping it",
@@ -367,39 +404,43 @@ impl<S: Send + Sync + 'static> Inner<S> {
             );
             return;
         }
-        let ctx = Ctx {
+
+        let ctx = Context {
             inner: self.clone(),
-            attempt: job.attempt,
+            attempt_count: job.attempt,
         };
 
         // A separate task, so a panic fails the attempt without losing the slot.
-        let mut task = tokio::spawn(handler.call.call(ctx, &*job.value));
-        let result = match tokio::time::timeout(TIMEOUT, &mut task).await {
+        let mut task = tokio::spawn(handler.invoker.invoke(ctx, &*job.payload));
+        let result = match tokio::time::timeout(ATTEMPT_TIMEOUT, &mut task).await {
             Ok(Ok(result)) => result,
             Ok(Err(err)) => Err(err.into()),
             Err(_) => {
                 task.abort();
-                Err(format!("timed out after {TIMEOUT:?}").into())
+                Err(format!("timed out after {ATTEMPT_TIMEOUT:?}").into())
             }
         };
 
         match result {
-            Ok(next) => {
-                let (id, persist) = (job.id, job.persist);
-                self.advance(job, next).await;
-                if persist {
-                    self.finish(id).await;
+            Ok(next_step) => {
+                let (job_id, durable) = (job.id, job.durable);
+                self.advance(job, next_step).await;
+
+                if durable {
+                    self.finish(job_id).await;
                 }
             }
-            Err(err) if job.attempt < job.retries => {
+            Err(err) if job.attempt < job.max_retries => {
                 job.attempt += 1;
                 let delay = retry_delay(job.attempt);
+
                 tracing::warn!(
                     handler = handler.name,
                     attempt = job.attempt,
                     ?delay,
                     "{err}; retrying"
                 );
+
                 let inner = self.clone();
                 tokio::spawn(async move {
                     tokio::time::sleep(delay).await;
@@ -410,25 +451,26 @@ impl<S: Send + Sync + 'static> Inner<S> {
                 tracing::error!(
                     handler = handler.name,
                     "{err}; giving up after {} retries",
-                    job.retries
+                    job.max_retries
                 );
-                if job.persist {
+
+                if job.durable {
                     self.fail(job.id, &err.to_string()).await;
                 }
             }
         }
     }
 
-    async fn advance(self: &Arc<Self>, job: Job, next: Next) {
+    async fn advance(self: &Arc<Self>, job: Job, next: NextStep) {
         if let Some(handoff) = next {
             let ty = (handoff.type_id, handoff.type_name);
             let queued = self
-                .queue(
+                .enqueue(
                     ty,
-                    handoff.value,
+                    handoff.payload,
                     handoff.priority.unwrap_or(job.priority),
-                    Some(handoff.retries.unwrap_or(job.retries)),
-                    job.persist || handoff.persist,
+                    Some(handoff.max_retries.unwrap_or(job.max_retries)),
+                    job.durable || handoff.durable,
                 )
                 .await;
             if let Err(err) = queued {
@@ -440,21 +482,21 @@ impl<S: Send + Sync + 'static> Inner<S> {
         }
     }
 
-    async fn finish(&self, id: u128) {
-        if let Err(err) = self.store.finish(id).await {
-            tracing::error!("store failed to finish job {id:032x}: {err}");
+    async fn finish(&self, job_id: JobId) {
+        if let Err(err) = self.store.finish(job_id).await {
+            tracing::error!("store failed to finish job {job_id:032x}: {err}");
         }
     }
 
-    async fn fail(&self, id: u128, error: &str) {
-        if let Err(err) = self.store.fail(id, error).await {
-            tracing::error!("store failed to mark job {id:032x} failed: {err}");
+    async fn fail(&self, job_id: JobId, error: &str) {
+        if let Err(err) = self.store.fail(job_id, error).await {
+            tracing::error!("store failed to mark job {job_id:032x} failed: {err}");
         }
     }
 
     /// Runs claimed records, earliest in line first.
-    fn replay(self: &Arc<Self>, records: Vec<Record>) {
-        let mut jobs: Vec<Job> = records.into_iter().filter_map(|r| self.job(r)).collect();
+    fn restore_jobs(self: &Arc<Self>, records: Vec<DurableJob>) {
+        let mut jobs: Vec<Job> = records.into_iter().filter_map(|r| self.restore_job(r)).collect();
         jobs.sort();
         for job in jobs {
             self.submit(job);
@@ -462,18 +504,18 @@ impl<S: Send + Sync + 'static> Inner<S> {
     }
 
     /// Turns a stored record back into a job, if a handler takes it.
-    fn job(&self, record: Record) -> Option<Job> {
-        let Some((&type_id, handler)) = self.handlers.iter().find(|(_, h)| h.name == record.name)
+    fn restore_job(&self, record: DurableJob) -> Option<Job> {
+        let Some((&type_id, handler)) = self.handlers.iter().find(|(_, h)| h.name == record.handler_name)
         else {
             tracing::warn!(
                 "no handler named {:?}; leaving job {:032x} in the store",
-                record.name,
+                record.handler_name,
                 record.id
             );
             return None;
         };
 
-        let value = match handler.call.decode(&record.payload) {
+        let value = match handler.invoker.decode(&record.payload) {
             Ok(value) => value,
             Err(err) => {
                 tracing::error!(
@@ -491,33 +533,33 @@ impl<S: Send + Sync + 'static> Inner<S> {
         Some(Job {
             id: record.id,
             type_id,
-            value,
+            payload: value,
             priority: record.priority,
-            retries: record.retries,
+            max_retries: record.max_retries,
             attempt: 0,
-            persist: true,
+            durable: true,
             enqueued_at: Instant::now().checked_sub(age).unwrap_or_else(Instant::now),
-            seq: self.seq.fetch_add(1, AtomicOrdering::Relaxed),
+            sequence: self.sequence.fetch_add(1, AtomicOrdering::Relaxed),
         })
     }
 }
 
 /// Holds a slot: runs `job`, then the rest of its handler's line.
-async fn work<S: Send + Sync + 'static>(inner: Arc<Inner<S>>, mut job: Job) {
+async fn run_handler_slot<S: Send + Sync + 'static>(inner: Arc<Inner<S>>, mut job: Job) {
     let type_id = job.type_id;
     loop {
-        inner.attempt(job).await;
+        inner.run_attempt(job).await;
 
-        let mut lane = inner.handlers[&type_id].lane.lock().unwrap();
-        let next = match inner.state.load(AtomicOrdering::SeqCst) {
-            RUNNING => lane.waiting.pop(),
+        let mut handler_queue = inner.handlers[&type_id].queue.lock().unwrap();
+        let next = match inner.lifecycle.load() {
+            Lifecycle::Running => handler_queue.pending.pop(),
             _ => None,
         };
         match next {
             Some(Reverse(next)) => job = next,
             None => {
-                lane.running -= 1;
-                drop(lane);
+                handler_queue.running -= 1;
+                drop(handler_queue);
                 inner.idle.notify_waiters();
                 return;
             }
@@ -525,30 +567,33 @@ async fn work<S: Send + Sync + 'static>(inner: Arc<Inner<S>>, mut job: Job) {
     }
 }
 
-/// Claims jobs from stopped processes every `CLAIM_INTERVAL`, until shutdown.
-async fn claim_loop<S: Send + Sync + 'static>(inner: Weak<Inner<S>>) {
+/// Reclaims jobs from stopped processes every `CLAIM_INTERVAL`, until shutdown.
+async fn reclaim_loop<S: Send + Sync + 'static>(inner: Weak<Inner<S>>) {
     loop {
-        tokio::time::sleep(CLAIM_INTERVAL).await;
+        tokio::time::sleep(RECLAIM_INTERVAL).await;
+
         let Some(inner) = inner.upgrade() else {
             return;
         };
-        if inner.state.load(AtomicOrdering::SeqCst) != RUNNING {
+
+        if inner.lifecycle.load() != Lifecycle::Running {
             return;
         }
-        match inner.store.claim().await {
-            Ok(records) => inner.replay(records),
+
+        match inner.store.reclaim_stale().await {
+            Ok(recovered) => inner.restore_jobs(recovered),
             Err(err) => tracing::error!("store failed to claim jobs: {err}"),
         }
     }
 }
 
-fn record<S>(handler: &Handler<S>, job: &Job) -> Result<Record, BoxError> {
-    Ok(Record {
+fn to_record<S>(handler: &Handler<S>, job: &Job) -> Result<DurableJob, BoxError> {
+    Ok(DurableJob {
         id: job.id,
-        name: handler.name.to_string(),
-        payload: handler.call.encode(&*job.value)?,
+        handler_name: handler.name.to_string(),
+        payload: handler.invoker.encode(&*job.payload)?,
         priority: job.priority,
-        retries: job.retries,
+        max_retries: job.max_retries,
         enqueued_at: SystemTime::now()
             .checked_sub(job.enqueued_at.elapsed())
             .unwrap_or(UNIX_EPOCH),
@@ -558,7 +603,7 @@ fn record<S>(handler: &Handler<S>, job: &Job) -> Result<Record, BoxError> {
 /// 1s, 2s, 4s… up to 5 minutes, ±10% so retries don't line up.
 fn retry_delay(attempt: u8) -> Duration {
     let doublings = u32::from(attempt.saturating_sub(1)).min(31);
-    let delay = BASE_RETRY_DELAY
+    let delay = INITIAL_RETRY_DELAY
         .saturating_mul(1 << doublings)
         .min(MAX_RETRY_DELAY);
     delay
@@ -567,42 +612,42 @@ fn retry_delay(attempt: u8) -> Duration {
 }
 
 /// A handler with its types erased, so one `Tasque` can hold them all.
-trait Call<S>: Send + Sync {
-    fn call(&self, ctx: Ctx<S>, value: &(dyn Any + Send)) -> CallFuture;
+trait Invoker<S>: Send + Sync {
+    fn invoke(&self, ctx: Context<S>, value: &(dyn Any + Send)) -> HandlerFuture;
     fn encode(&self, value: &(dyn Any + Send)) -> Result<Vec<u8>, BoxError>;
-    fn decode(&self, bytes: &[u8]) -> Result<Value, BoxError>;
+    fn decode(&self, bytes: &[u8]) -> Result<ErasedJobPayload, BoxError>;
 }
 
-struct FnCall<I, F, O> {
+struct FunctionInvoker<I, F, O> {
     f: F,
     _types: PhantomData<fn(I) -> O>,
 }
 
-impl<S, I, F, Fut, O> Call<S> for FnCall<I, F, O>
+impl<S, I, F, Fut, O> Invoker<S> for FunctionInvoker<I, F, O>
 where
     S: Send + Sync + 'static,
     I: Clone + Serialize + DeserializeOwned + Send + 'static,
-    F: Fn(Ctx<S>, I) -> Fut + Send + Sync + 'static,
+    F: Fn(Context<S>, I) -> Fut + Send + Sync + 'static,
     Fut: Future<Output = Result<O, BoxError>> + Send + 'static,
     O: IntoStep,
 {
-    fn call(&self, ctx: Ctx<S>, value: &(dyn Any + Send)) -> CallFuture {
-        let input = downcast::<I>(value).clone();
+    fn invoke(&self, ctx: Context<S>, payload: &(dyn Any + Send)) -> HandlerFuture {
+        let input = downcast::<I>(payload).clone();
         let future = (self.f)(ctx, input);
-        Box::pin(async move { future.await.map(IntoStep::into_next) })
+        Box::pin(async move { future.await.map(IntoStep::into_handoff) })
     }
 
     fn encode(&self, value: &(dyn Any + Send)) -> Result<Vec<u8>, BoxError> {
         crate::codec::encode(downcast::<I>(value))
     }
 
-    fn decode(&self, bytes: &[u8]) -> Result<Value, BoxError> {
+    fn decode(&self, bytes: &[u8]) -> Result<ErasedJobPayload, BoxError> {
         Ok(Box::new(crate::codec::decode::<I>(bytes)?))
     }
 }
 
-fn downcast<I: 'static>(value: &(dyn Any + Send)) -> &I {
-    value
+fn downcast<I: 'static>(payload: &(dyn Any + Send)) -> &I {
+    payload
         .downcast_ref::<I>()
         .expect("jobs are only routed to the handler of their type")
 }
@@ -613,21 +658,21 @@ mod tests {
 
     fn job(priority: Priority, enqueued_at: Instant, seq: u64) -> Job {
         Job {
-            id: 0,
+            id: JobId::nil(),
             type_id: TypeId::of::<()>(),
-            value: Box::new(()),
+            payload: Box::new(()),
             priority,
-            retries: 0,
+            max_retries: 0,
             attempt: 0,
-            persist: false,
+            durable: false,
             enqueued_at,
-            seq,
+            sequence: seq,
         }
     }
 
     fn line(jobs: Vec<Job>) -> Vec<u64> {
         let mut heap: BinaryHeap<Reverse<Job>> = jobs.into_iter().map(Reverse).collect();
-        std::iter::from_fn(|| heap.pop().map(|Reverse(job)| job.seq)).collect()
+        std::iter::from_fn(|| heap.pop().map(|Reverse(job)| job.sequence)).collect()
     }
 
     #[test]
@@ -638,6 +683,7 @@ mod tests {
             job(Priority::Medium, now, 1),
             job(Priority::High, now, 2),
         ]);
+
         assert_eq!(order, [2, 1, 0]);
     }
 
@@ -649,16 +695,18 @@ mod tests {
             job(Priority::Medium, now, 2),
             job(Priority::Medium, now, 1),
         ]);
+
         assert_eq!(order, [1, 2, 0]);
     }
 
     #[test]
-    fn a_waiting_job_is_only_passed_within_the_head_start() {
+    fn a_pending_job_is_only_passed_within_the_head_start() {
         let now = Instant::now();
         let low = job(Priority::Low, now, 0);
         // Two levels up gets 2 minutes of head start.
         let high_soon = job(Priority::High, now + Duration::from_secs(119), 1);
         let high_late = job(Priority::High, now + Duration::from_secs(121), 2);
+
         assert_eq!(line(vec![low, high_soon, high_late]), [1, 0, 2]);
     }
 
@@ -667,11 +715,13 @@ mod tests {
         for (attempt, expected) in [(1, 1), (2, 2), (3, 4), (4, 8)] {
             let delay = retry_delay(attempt).as_secs_f64();
             let expected = expected as f64;
+
             assert!(
                 (expected * 0.9..=expected * 1.1).contains(&delay),
                 "attempt {attempt}: {delay}s"
             );
         }
+
         assert!(retry_delay(u8::MAX) <= MAX_RETRY_DELAY);
     }
 }

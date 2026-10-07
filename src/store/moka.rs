@@ -1,20 +1,20 @@
-use crate::{BoxError, Record, Store};
+use crate::{BoxError, DurableJob, JobId, Store};
 use async_trait::async_trait;
 use moka::future::Cache;
 use moka::ops::compute::Op;
 
 /// Keeps jobs in memory. For tests and apps that never persist.
 ///
-/// Everything in it belongs to the one process holding it, so [`claim`](Store::claim)
+/// Everything in it belongs to the one process holding it, so [`claim`](Store::reclaim_stale)
 /// only returns jobs after a [`release`](Store::release).
 pub struct MokaStore {
     // Unbounded: an eviction would silently drop a pending job.
-    records: Cache<u128, Entry>,
+    records: Cache<JobId, Entry>,
 }
 
 #[derive(Clone)]
 struct Entry {
-    record: Record,
+    record: DurableJob,
     owned: bool,
 }
 
@@ -28,7 +28,7 @@ impl Default for MokaStore {
 
 impl MokaStore {
     /// Sets `owned` on the job `id`, if it's still there.
-    async fn set_owned(&self, id: u128, owned: bool) {
+    async fn set_owned(&self, id: JobId, owned: bool) {
         self.records
             .entry(id)
             .and_compute_with(|entry| async move {
@@ -46,7 +46,7 @@ impl MokaStore {
 
 #[async_trait]
 impl Store for MokaStore {
-    async fn save(&self, record: &Record) -> Result<(), BoxError> {
+    async fn save(&self, record: &DurableJob) -> Result<(), BoxError> {
         let entry = Entry {
             record: record.clone(),
             owned: true,
@@ -55,18 +55,18 @@ impl Store for MokaStore {
         Ok(())
     }
 
-    async fn finish(&self, id: u128) -> Result<(), BoxError> {
+    async fn finish(&self, id: JobId) -> Result<(), BoxError> {
         self.records.invalidate(&id).await;
         Ok(())
     }
 
-    async fn fail(&self, id: u128, _error: &str) -> Result<(), BoxError> {
+    async fn fail(&self, id: JobId, _error: &str) -> Result<(), BoxError> {
         self.records.invalidate(&id).await;
         Ok(())
     }
 
-    async fn claim(&self) -> Result<Vec<Record>, BoxError> {
-        let released: Vec<Record> = self
+    async fn reclaim_stale(&self) -> Result<Vec<DurableJob>, BoxError> {
+        let released: Vec<DurableJob> = self
             .records
             .iter()
             .filter(|(_, entry)| !entry.owned)
@@ -79,7 +79,7 @@ impl Store for MokaStore {
     }
 
     async fn release(&self) -> Result<(), BoxError> {
-        let owned: Vec<u128> = self
+        let owned: Vec<JobId> = self
             .records
             .iter()
             .filter(|(_, entry)| entry.owned)

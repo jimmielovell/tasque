@@ -3,10 +3,9 @@
 use scylla::client::session::Session;
 use scylla::client::session_builder::SessionBuilder;
 use serde::{Deserialize, Serialize};
-use std::sync::atomic::{AtomicU64, Ordering};
 use std::sync::{Arc, Mutex};
 use std::time::{Duration, SystemTime};
-use tasque::{BoxError, Priority, Record, ScyllaStore, ScyllaStoreBuilder, Store, Tasque};
+use tasque::{BoxError, DurableJob, JobId, Priority, ScyllaStore, ScyllaStoreBuilder, Store, Tasque};
 use tokio::time::sleep;
 
 const KEYSPACE: &str = "tasque_test";
@@ -47,14 +46,13 @@ fn builder(session: &Arc<Session>, prefix: &str) -> ScyllaStoreBuilder {
         .unwrap()
 }
 
-fn record(name: &str) -> Record {
-    static NEXT: AtomicU64 = AtomicU64::new(1);
-    Record {
-        id: u128::from(NEXT.fetch_add(1, Ordering::Relaxed)),
-        name: name.into(),
+fn record(name: &str) -> DurableJob {
+    DurableJob {
+        id: JobId::now_v7(),
+        handler_name: name.into(),
         payload: name.as_bytes().to_vec(),
         priority: Priority::Medium,
-        retries: 200,
+        max_retries: 200,
         enqueued_at: SystemTime::UNIX_EPOCH + Duration::from_millis(1_700_000_000_000),
     }
 }
@@ -86,18 +84,18 @@ async fn released_jobs_are_claimed_by_another_process() {
     a.finish(done.id).await.unwrap();
 
     // `a` is alive, so nothing is claimable yet.
-    assert!(b.claim().await.unwrap().is_empty());
+    assert!(b.reclaim_stale().await.unwrap().is_empty());
 
     a.release().await.unwrap();
-    let claimed = b.claim().await.unwrap();
+    let claimed = b.reclaim_stale().await.unwrap();
     assert_eq!(claimed.len(), 1);
     let job = &claimed[0];
-    assert_eq!((job.id, job.name.as_str()), (pending.id, "pending"));
+    assert_eq!((job.id, job.handler_name.as_str()), (pending.id, "pending"));
     assert_eq!(job.payload, pending.payload);
-    assert_eq!((job.priority, job.retries), (Priority::Medium, 200));
+    assert_eq!((job.priority, job.max_retries), (Priority::Medium, 200));
     assert_eq!(job.enqueued_at, pending.enqueued_at);
 
-    assert!(b.claim().await.unwrap().is_empty());
+    assert!(b.reclaim_stale().await.unwrap().is_empty());
 }
 
 #[tokio::test(flavor = "multi_thread")]
@@ -109,15 +107,15 @@ async fn a_silent_process_is_claimed_once_stale_and_only_once() {
 
     let b = another(&session, "t_silent").await;
     let c = another(&session, "t_silent").await;
-    assert!(b.claim().await.unwrap().is_empty());
+    assert!(b.reclaim_stale().await.unwrap().is_empty());
 
     sleep(Duration::from_secs(16)).await;
-    let (b_claimed, c_claimed) = tokio::join!(b.claim(), c.claim());
+    let (b_claimed, c_claimed) = tokio::join!(b.reclaim_stale(), c.reclaim_stale());
     let names: Vec<String> = b_claimed
         .unwrap()
         .into_iter()
         .chain(c_claimed.unwrap())
-        .map(|r| r.name)
+        .map(|r| r.handler_name)
         .collect();
     assert_eq!(names, ["orphan"]);
 }
@@ -150,7 +148,7 @@ async fn a_failed_job_is_recorded_and_not_claimed() {
 
     a.release().await.unwrap();
     let b = another(&session, "t_failed").await;
-    assert!(b.claim().await.unwrap().is_empty());
+    assert!(b.reclaim_stale().await.unwrap().is_empty());
 }
 
 #[tokio::test(flavor = "multi_thread")]
@@ -162,7 +160,7 @@ async fn drained_workers_are_removed() {
     a.release().await.unwrap();
 
     let b = another(&session, "t_drained").await;
-    assert_eq!(b.claim().await.unwrap().len(), 1);
+    assert_eq!(b.reclaim_stale().await.unwrap().len(), 1);
     b.finish(job.id).await.unwrap();
     // Only `b`'s own worker is left.
     assert_eq!(workers(&session, "t_drained").await, 1);
@@ -223,7 +221,7 @@ async fn a_process_whose_worker_was_reclaimed_lets_go_of_its_jobs_and_moves_to_a
     let a = fresh(&session, "t_lost").await;
     let first = record("first");
     a.save(&first).await.unwrap();
-    assert!(a.owns(first.id));
+    assert!(a.is_owned(first.id));
 
     // Expire `a`'s lease, as if `a` had paused for too long.
     let (worker_id, owner_id) = session
@@ -250,27 +248,27 @@ async fn a_process_whose_worker_was_reclaimed_lets_go_of_its_jobs_and_moves_to_a
 
     let b = another(&session, "t_lost").await;
     let reclaimed: Vec<String> = b
-        .claim()
+        .reclaim_stale()
         .await
         .unwrap()
         .into_iter()
-        .map(|r| r.name)
+        .map(|r| r.handler_name)
         .collect();
     assert_eq!(reclaimed, ["first"]);
     b.finish(first.id).await.unwrap();
 
     // `a` notices at its next heartbeat, lets go of the job and moves to a new worker.
     sleep(Duration::from_secs(6)).await;
-    assert!(!a.owns(first.id));
+    assert!(!a.is_owned(first.id));
     a.finish(first.id).await.unwrap();
     a.save(&record("second")).await.unwrap();
     a.release().await.unwrap();
     let reclaimed: Vec<String> = b
-        .claim()
+        .reclaim_stale()
         .await
         .unwrap()
         .into_iter()
-        .map(|r| r.name)
+        .map(|r| r.handler_name)
         .collect();
     assert_eq!(reclaimed, ["second"]);
 }

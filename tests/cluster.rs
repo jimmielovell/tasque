@@ -116,7 +116,7 @@ impl Process {
                 },
             )
             .add("job", |ctx, Job { id, kind }| async move {
-                let attempt = ctx.attempt();
+                let attempt = ctx.attempt_count();
                 ctx.ledger
                     .runs
                     .lock()

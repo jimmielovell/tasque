@@ -8,7 +8,7 @@ mod builder;
 
 pub use builder::ScyllaStoreBuilder;
 
-use crate::{BoxError, Priority, Record, Store};
+use crate::{BoxError, DurableJob, JobId, Priority, Store};
 use async_trait::async_trait;
 use futures::StreamExt;
 use scylla::client::session::Session;
@@ -30,7 +30,6 @@ const WORKER_LEASE_TIMEOUT: Duration = Duration::from_secs(15);
 const HOUR_MS: i64 = 60 * 60 * 1000;
 const DAY_MS: i64 = 24 * HOUR_MS;
 
-type JobId = u128;
 /// The worker a job is filed under.
 type WorkerId = Uuid;
 /// The process that owns a worker.
@@ -166,7 +165,7 @@ impl Inner {
             status as i8,
             location.worker_id,
             location.hour_bucket,
-            Uuid::from_u128(job_id),
+            job_id,
         );
         self.session
             .execute_unpaged(&self.statements.update_job_status, values)
@@ -306,7 +305,7 @@ impl Inner {
     }
 
     /// Reclaims every worker whose lease has gone stale, returning their unfinished jobs.
-    async fn reclaim_stale_workers(&self) -> Result<Vec<Record>, BoxError> {
+    async fn reclaim_stale_workers(&self) -> Result<Vec<DurableJob>, BoxError> {
         if self.ownership.lock().unwrap().released {
             return Ok(Vec::new());
         }
@@ -355,7 +354,7 @@ impl Inner {
         previous_owner_id: OwnerId,
         last_heartbeat_at: CqlTimestamp,
         oldest_job_bucket: HourBucket,
-    ) -> Result<Vec<Record>, BoxError> {
+    ) -> Result<Vec<DurableJob>, BoxError> {
         let now = now_ms();
         let values = (
             self.owner_id,
@@ -395,7 +394,7 @@ impl Inner {
     }
 
     /// The pending jobs filed at `location`.
-    async fn scan_job_bucket(&self, location: JobLocation) -> Result<Vec<Record>, BoxError> {
+    async fn scan_job_bucket(&self, location: JobLocation) -> Result<Vec<DurableJob>, BoxError> {
         let mut rows = self
             .session
             .execute_iter(
@@ -429,9 +428,9 @@ type WorkerRow = (
     Option<HourBucket>,
 );
 
-/// job_id, name, payload, priority, retries, enqueued_at, status
+/// job_id, handler_name, payload, priority, max_retries, enqueued_at, status
 type JobRow = (
-    Uuid,
+    JobId,
     Option<String>,
     Option<Vec<u8>>,
     Option<i8>,
@@ -443,19 +442,19 @@ type JobRow = (
 /// The job in `row`, unless part of it has expired.
 fn job_from_row(
     (job_id, name, payload, priority, retries, enqueued_at, _): JobRow,
-) -> Option<Record> {
+) -> Option<DurableJob> {
     let priority = match priority? {
         2 => Priority::High,
         1 => Priority::Medium,
         _ => Priority::Low,
     };
 
-    Some(Record {
-        id: job_id.as_u128(),
-        name: name?,
+    Some(DurableJob {
+        id: job_id,
+        handler_name: name?,
         payload: payload?,
         priority,
-        retries: retries?.clamp(0, u8::MAX.into()) as u8,
+        max_retries: retries?.clamp(0, u8::MAX.into()) as u8,
         enqueued_at: UNIX_EPOCH + Duration::from_millis(enqueued_at?.0.max(0) as u64),
     })
 }
@@ -484,7 +483,7 @@ async fn heartbeat_loop(inner: Weak<Inner>) {
 
 #[async_trait]
 impl Store for ScyllaStore {
-    async fn save(&self, record: &Record) -> Result<(), BoxError> {
+    async fn save(&self, record: &DurableJob) -> Result<(), BoxError> {
         let inner = &self.inner;
         let location = JobLocation {
             worker_id: inner.own_worker_for_new_job().await?,
@@ -493,11 +492,11 @@ impl Store for ScyllaStore {
         let values = (
             location.worker_id,
             location.hour_bucket,
-            Uuid::from_u128(record.id),
-            record.name.as_str(),
+            record.id,
+            record.handler_name.as_str(),
             record.payload.as_slice(),
             record.priority as i8,
-            i16::from(record.retries),
+            i16::from(record.max_retries),
             CqlTimestamp(millis(record.enqueued_at)),
         );
         inner
@@ -533,13 +532,12 @@ impl Store for ScyllaStore {
         let Some(location) = inner.job_location(job_id) else {
             return Ok(());
         };
-        let uuid = Uuid::from_u128(job_id);
 
         let job = inner
             .session
             .execute_unpaged(
                 &inner.statements.load_job,
-                (location.worker_id, location.hour_bucket, uuid),
+                (location.worker_id, location.hour_bucket, job_id),
             )
             .await?
             .into_rows_result()?
@@ -549,7 +547,7 @@ impl Store for ScyllaStore {
             let values = (
                 now / DAY_MS,
                 CqlTimestamp(now),
-                uuid,
+                job_id,
                 name,
                 payload,
                 priority,
@@ -569,11 +567,11 @@ impl Store for ScyllaStore {
         inner.untrack_job(job_id, location).await
     }
 
-    async fn claim(&self) -> Result<Vec<Record>, BoxError> {
+    async fn reclaim_stale(&self) -> Result<Vec<DurableJob>, BoxError> {
         self.inner.reclaim_stale_workers().await
     }
 
-    fn owns(&self, job_id: JobId) -> bool {
+    fn is_owned(&self, job_id: JobId) -> bool {
         self.inner
             .ownership
             .lock()

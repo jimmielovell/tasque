@@ -1,5 +1,5 @@
 use crate::Priority;
-use std::any::{Any, TypeId, type_name};
+use std::any::{type_name, Any, TypeId};
 
 /// What a handler does next: hand off with [`Step::next`] or finish with [`Step::done`].
 /// Handlers that never hand off can return `Ok(())` instead.
@@ -10,30 +10,30 @@ use std::any::{Any, TypeId, type_name};
 /// Ok(Step::next(email).retries(5).persist())
 /// ```
 pub struct Step<T> {
-    next: Option<T>,
+    job: Option<T>,
     priority: Option<Priority>,
-    retries: Option<u8>,
-    persist: bool,
+    max_retries: Option<u8>,
+    durable: bool,
 }
 
 impl<T> Step<T> {
     /// Hands `job` to its type's handler.
     pub fn next(job: T) -> Self {
         Self {
-            next: Some(job),
+            job: Some(job),
             priority: None,
-            retries: None,
-            persist: false,
+            max_retries: None,
+            durable: false,
         }
     }
 
     /// Finishes the job.
     pub fn done() -> Self {
         Self {
-            next: None,
+            job: None,
             priority: None,
-            retries: None,
-            persist: false,
+            max_retries: None,
+            durable: false,
         }
     }
 
@@ -43,15 +43,15 @@ impl<T> Step<T> {
         self
     }
 
-    /// Overrides the next job's retries.
-    pub fn retries(mut self, retries: u8) -> Self {
-        self.retries = Some(retries);
+    /// Overrides the next job's maximum retries.
+    pub fn max_retries(mut self, max_retries: u8) -> Self {
+        self.max_retries = Some(max_retries);
         self
     }
 
     /// Persists the next job. A persisted job's next job is always persisted.
-    pub fn persist(mut self) -> Self {
-        self.persist = true;
+    pub fn durable(mut self) -> Self {
+        self.durable = true;
         self
     }
 }
@@ -61,10 +61,10 @@ impl<T> Step<T> {
 pub struct Handoff {
     pub(crate) type_id: TypeId,
     pub(crate) type_name: &'static str,
-    pub(crate) value: Box<dyn Any + Send>,
+    pub(crate) payload: Box<dyn Any + Send>,
     pub(crate) priority: Option<Priority>,
-    pub(crate) retries: Option<u8>,
-    pub(crate) persist: bool,
+    pub(crate) max_retries: Option<u8>,
+    pub(crate) durable: bool,
 }
 
 mod sealed {
@@ -76,36 +76,36 @@ mod sealed {
 /// What a handler may return on success: `()` or a [`Step`].
 pub trait IntoStep: sealed::Sealed + Send + 'static {
     #[doc(hidden)]
-    fn next_type() -> Option<(TypeId, &'static str)>;
+    fn next_handler() -> Option<(TypeId, &'static str)>;
 
     #[doc(hidden)]
-    fn into_next(self) -> Option<Handoff>;
+    fn into_handoff(self) -> Option<Handoff>;
 }
 
 impl IntoStep for () {
-    fn next_type() -> Option<(TypeId, &'static str)> {
+    fn next_handler() -> Option<(TypeId, &'static str)> {
         None
     }
 
-    fn into_next(self) -> Option<Handoff> {
+    fn into_handoff(self) -> Option<Handoff> {
         None
     }
 }
 
 impl<T: Send + 'static> IntoStep for Step<T> {
-    fn next_type() -> Option<(TypeId, &'static str)> {
+    fn next_handler() -> Option<(TypeId, &'static str)> {
         Some((TypeId::of::<T>(), type_name::<T>()))
     }
 
-    fn into_next(self) -> Option<Handoff> {
-        let job = self.next?;
+    fn into_handoff(self) -> Option<Handoff> {
+        let job = self.job?;
         Some(Handoff {
             type_id: TypeId::of::<T>(),
             type_name: type_name::<T>(),
-            value: Box::new(job),
+            payload: Box::new(job),
             priority: self.priority,
-            retries: self.retries,
-            persist: self.persist,
+            max_retries: self.max_retries,
+            durable: self.durable,
         })
     }
 }
