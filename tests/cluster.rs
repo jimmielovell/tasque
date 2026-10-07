@@ -87,7 +87,7 @@ async fn session() -> Arc<Session> {
 struct Process {
     name: &'static str,
     runtime: Runtime,
-    tasque: Option<Tasque<Ctx>>,
+    tasque: Option<Tasque>,
 }
 
 impl Process {
@@ -108,14 +108,12 @@ impl Process {
                 .build()
                 .await
                 .unwrap();
-            Tasque::new(
-                store,
-                Ctx {
-                    process: name,
-                    ledger,
-                },
-            )
-            .add("job", |ctx, Job { id, kind }| async move {
+            let ctx = Arc::new(Ctx {
+                process: name,
+                ledger,
+            });
+            Tasque::new(store)
+            .add("job", ctx.clone(), |ctx, Job { id, kind }| async move {
                 let attempt = ctx.attempt_count();
                 ctx.ledger
                     .runs
@@ -134,7 +132,7 @@ impl Process {
                     }
                 }
             })
-            .add("follow_up", |ctx, FollowUp { id }| async move {
+            .add("follow_up", ctx, |ctx, FollowUp { id }| async move {
                 tokio::time::sleep(Duration::from_millis(300)).await;
                 ctx.ledger.complete(id);
                 Ok(())

@@ -177,10 +177,10 @@ struct Email {
 async fn mailer(
     store: ScyllaStore,
     fail: bool,
-) -> (Tasque<Arc<Mutex<Vec<String>>>>, Arc<Mutex<Vec<String>>>) {
+) -> (Tasque, Arc<Mutex<Vec<String>>>) {
     let sent = Arc::new(Mutex::new(Vec::new()));
-    let t = Tasque::new(store, sent.clone())
-        .add("email", move |ctx, Email { address }| async move {
+    let t = Tasque::new(store)
+        .add("email", sent.clone(), move |ctx, Email { address }| async move {
             if fail {
                 return Err::<(), BoxError>("mail server down".into());
             }

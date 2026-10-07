@@ -40,7 +40,7 @@ struct State {
     email_after: Mutex<Option<Duration>>,
 }
 
-async fn tasque() -> (Tasque<Arc<State>>, Arc<State>) {
+async fn tasque() -> (Tasque, Arc<State>) {
     let state = Arc::new(State {
         began: Instant::now(),
         running: AtomicUsize::new(0),
@@ -49,8 +49,8 @@ async fn tasque() -> (Tasque<Arc<State>>, Arc<State>) {
         email_after: Mutex::default(),
     });
 
-    let t = Tasque::new(MokaStore::default(), state.clone())
-        .add("work", |ctx, Work { label, secs }| async move {
+    let t = Tasque::new(MokaStore::default())
+        .add("work", state.clone(), |ctx, Work { label, secs }| async move {
             let running = ctx.running.fetch_add(1, Ordering::SeqCst) + 1;
             ctx.most_running.fetch_max(running, Ordering::SeqCst);
             ctx.started.lock().unwrap().push(label);
@@ -58,11 +58,11 @@ async fn tasque() -> (Tasque<Arc<State>>, Arc<State>) {
             ctx.running.fetch_sub(1, Ordering::SeqCst);
             Ok(())
         })
-        .add("push", |_ctx, Push { secs }| async move {
+        .add("push", (), |_ctx, Push { secs }| async move {
             sleep(Duration::from_secs(secs)).await;
             Ok(())
         })
-        .add("chain", |ctx, Chain { label, left }| async move {
+        .add("chain", state.clone(), |ctx, Chain { label, left }| async move {
             if left == 0 {
                 ctx.started.lock().unwrap().push(label.clone());
             }
@@ -75,10 +75,10 @@ async fn tasque() -> (Tasque<Arc<State>>, Arc<State>) {
                 }),
             })
         })
-        .add("relay", |_ctx, Relay { label }| async move {
+        .add("relay", (), |_ctx, Relay { label }| async move {
             Ok(Step::next(work(&label, 0)).priority(Priority::High))
         })
-        .add("email", |ctx, Email| async move {
+        .add("email", state.clone(), |ctx, Email| async move {
             *ctx.email_after.lock().unwrap() = Some(ctx.began.elapsed());
             Ok(())
         })

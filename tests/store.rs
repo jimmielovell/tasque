@@ -52,10 +52,10 @@ enum Emails {
     Fail,
 }
 
-async fn tasque(store: Arc<MokaStore>, emails: Emails) -> (Tasque<Arc<State>>, Arc<State>) {
+async fn tasque(store: Arc<MokaStore>, emails: Emails) -> (Tasque, Arc<State>) {
     let state = Arc::new(State::default());
-    let t = Tasque::new(store, state.clone())
-        .add("email", move |ctx, Email { address }| async move {
+    let t = Tasque::new(store)
+        .add("email", state.clone(), move |ctx, Email { address }| async move {
             let Emails::Take(secs) = emails else {
                 return Err("mail server down".into());
             };
@@ -63,18 +63,18 @@ async fn tasque(store: Arc<MokaStore>, emails: Emails) -> (Tasque<Arc<State>>, A
             ctx.sent.lock().unwrap().push(address);
             Ok(())
         })
-        .add("pdf", |ctx, Pdf { address }| async move {
+        .add("pdf", state.clone(), |ctx, Pdf { address }| async move {
             ctx.pdfs.fetch_add(1, Ordering::SeqCst);
             Ok(Step::next(Email { address }))
         })
-        .add("slow_pdf", |_ctx, SlowPdf { address }| async move {
+        .add("slow_pdf", (), |_ctx, SlowPdf { address }| async move {
             sleep(Duration::from_secs(5)).await;
             Ok(Step::next(Email { address }))
         })
-        .add("extract", |_ctx, Extract { address }| async move {
+        .add("extract", (), |_ctx, Extract { address }| async move {
             Ok(Step::next(Email { address }).durable())
         })
-        .add("fails", |_ctx, Fails| async move {
+        .add("fails", (), |_ctx, Fails| async move {
             Err::<(), BoxError>("always".into())
         })
         .run()
@@ -316,8 +316,8 @@ async fn queue_fails_when_the_store_does() {
     }
 
     let state = Arc::new(State::default());
-    let t = Tasque::new(Down, state.clone())
-        .add("email", |ctx, Email { address }| async move {
+    let t = Tasque::new(Down)
+        .add("email", state.clone(), |ctx, Email { address }| async move {
             ctx.sent.lock().unwrap().push(address);
             Ok(())
         })
@@ -372,12 +372,12 @@ async fn a_next_step_the_store_refuses_does_not_hold_back_the_one_before() {
 
     let store = Arc::new(NoEmails::default());
     let state = Arc::new(State::default());
-    let t = Tasque::new(store.clone(), state.clone())
-        .add("email", |ctx, Email { address }| async move {
+    let t = Tasque::new(store.clone())
+        .add("email", state.clone(), |ctx, Email { address }| async move {
             ctx.sent.lock().unwrap().push(address);
             Ok(())
         })
-        .add("pdf", |ctx, Pdf { address }| async move {
+        .add("pdf", state.clone(), |ctx, Pdf { address }| async move {
             ctx.pdfs.fetch_add(1, Ordering::SeqCst);
             Ok(Step::next(Email { address }))
         })
@@ -432,8 +432,8 @@ async fn a_job_claimed_by_another_process_is_not_retried_here() {
 
     let store = Arc::new(Losable::default());
     let state = Arc::new(State::default());
-    let t = Tasque::new(store.clone(), state.clone())
-        .add("fails", |ctx, Fails| async move {
+    let t = Tasque::new(store.clone())
+        .add("fails", state.clone(), |ctx, Fails| async move {
             ctx.pdfs.fetch_add(1, Ordering::SeqCst);
             Err::<(), BoxError>("always".into())
         })

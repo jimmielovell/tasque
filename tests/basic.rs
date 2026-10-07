@@ -68,15 +68,16 @@ fn email(address: &str) -> Email {
 }
 
 #[allow(unreachable_code)]
-async fn tasque() -> (Tasque<Arc<State>>, Arc<State>) {
+async fn tasque() -> (Tasque, Arc<State>) {
     let state = Arc::new(State::default());
-    let t = Tasque::new(MokaStore::default(), state.clone())
-        .add("email", |ctx, Email { address, body }| async move {
+    let t = Tasque::new(MokaStore::default())
+        .add("email", state.clone(), |ctx, Email { address, body }| async move {
             ctx.sent.lock().unwrap().push((address, body));
             Ok(())
         })
         .add(
             "pdf",
+            (),
             |_ctx,
              Pdf {
                  email_address,
@@ -89,7 +90,7 @@ async fn tasque() -> (Tasque<Arc<State>>, Arc<State>) {
                 }))
             },
         )
-        .add("flaky", |ctx, Flaky { succeed_on }| async move {
+        .add("flaky", state.clone(), |ctx, Flaky { succeed_on }| async move {
             ctx.runs.fetch_add(1, Ordering::SeqCst);
             ctx.attempts.lock().unwrap().push(ctx.attempt_count());
             if ctx.attempt_count() < succeed_on {
@@ -97,7 +98,7 @@ async fn tasque() -> (Tasque<Arc<State>>, Arc<State>) {
             }
             Ok(())
         })
-        .add("relay", |_ctx, Relay { retries }| async move {
+        .add("relay", (), |_ctx, Relay { retries }| async move {
             let next = Step::next(Flaky {
                 succeed_on: u8::MAX,
             });
@@ -106,12 +107,12 @@ async fn tasque() -> (Tasque<Arc<State>>, Arc<State>) {
                 None => next,
             })
         })
-        .add("slow", |ctx, Slow| async move {
+        .add("slow", state.clone(), |ctx, Slow| async move {
             sleep(Duration::from_secs(60)).await;
             ctx.runs.fetch_add(1, Ordering::SeqCst);
             Ok(())
         })
-        .add("panics", |ctx, Panics| async move {
+        .add("panics", state.clone(), |ctx, Panics| async move {
             ctx.runs.fetch_add(1, Ordering::SeqCst);
             panic!("handler panicked");
             Ok(())
@@ -300,12 +301,12 @@ async fn a_handler_can_queue_more_jobs() {
     struct Fanout(Vec<String>);
 
     let state = Arc::new(State::default());
-    let t = Tasque::new(MokaStore::default(), state.clone())
-        .add("email", |ctx, Email { address, body }| async move {
+    let t = Tasque::new(MokaStore::default())
+        .add("email", state.clone(), |ctx, Email { address, body }| async move {
             ctx.sent.lock().unwrap().push((address, body));
             Ok(())
         })
-        .add("fanout", |ctx, Fanout(addresses)| async move {
+        .add("fanout", state.clone(), |ctx, Fanout(addresses)| async move {
             for address in addresses {
                 ctx.queue(email(&address), Priority::Low, None, false)
                     .await?;
@@ -325,6 +326,37 @@ async fn a_handler_can_queue_more_jobs() {
     assert_eq!(state.sent_to(), ["a@example.com", "b@example.com"]);
 }
 
+#[tokio::test(start_paused = true)]
+async fn each_handler_gets_its_own_state() {
+    let state = Arc::new(State::default());
+    let pdfs = Arc::new(AtomicU32::new(0));
+    let t = Tasque::new(MokaStore::default())
+        .add("email", state.clone(), |ctx, Email { address, body }| async move {
+            ctx.sent.lock().unwrap().push((address, body));
+            Ok(())
+        })
+        .add("pdf", pdfs.clone(), |ctx, Pdf { email_address, bytes }| async move {
+            ctx.fetch_add(1, Ordering::SeqCst);
+            Ok(Step::next(Email {
+                address: email_address,
+                body: String::from_utf8(bytes)?,
+            }))
+        })
+        .run()
+        .await
+        .unwrap();
+
+    let pdf = Pdf {
+        email_address: "a@example.com".into(),
+        bytes: b"text".to_vec(),
+    };
+    t.queue(pdf, Priority::Medium, None, false).await.unwrap();
+
+    sleep(Duration::from_millis(10)).await;
+    assert_eq!(pdfs.load(Ordering::SeqCst), 1);
+    assert_eq!(state.sent_to(), ["a@example.com"]);
+}
+
 #[tokio::test]
 async fn queueing_a_type_without_a_handler_fails() {
     let (t, _) = tasque().await;
@@ -337,9 +369,10 @@ async fn queueing_a_type_without_a_handler_fails() {
 
 #[tokio::test]
 async fn start_fails_when_a_next_step_has_no_handler() {
-    let result = Tasque::new(MokaStore::default(), ())
+    let result = Tasque::new(MokaStore::default())
         .add(
             "pdf",
+            (),
             |_ctx,
              Pdf {
                  email_address,
@@ -366,15 +399,15 @@ async fn start_fails_when_a_next_step_has_no_handler() {
 #[test]
 #[should_panic(expected = "a handler named \"email\" is already registered")]
 fn registering_a_name_twice_panics() {
-    let _ = Tasque::new(MokaStore::default(), ())
-        .add("email", |_ctx, _: Email| async move { Ok(()) })
-        .add("email", |_ctx, _: Pdf| async move { Ok(()) });
+    let _ = Tasque::new(MokaStore::default())
+        .add("email", (), |_ctx, _: Email| async move { Ok(()) })
+        .add("email", (), |_ctx, _: Pdf| async move { Ok(()) });
 }
 
 #[test]
 #[should_panic(expected = "is already registered")]
 fn registering_a_type_twice_panics() {
-    let _ = Tasque::new(MokaStore::default(), ())
-        .add("email", |_ctx, _: Email| async move { Ok(()) })
-        .add("email_again", |_ctx, _: Email| async move { Ok(()) });
+    let _ = Tasque::new(MokaStore::default())
+        .add("email", (), |_ctx, _: Email| async move { Ok(()) })
+        .add("email_again", (), |_ctx, _: Email| async move { Ok(()) });
 }

@@ -73,24 +73,16 @@ type NextStep = Option<Handoff>;
 type HandlerFuture = Pin<Box<dyn Future<Output = Result<NextStep, BoxError>> + Send>>;
 
 /// Runs each job on the handler registered for its type. Clones share the same handlers.
-pub struct Tasque<S> {
-    inner: Arc<Inner<S>>,
+#[derive(Clone)]
+pub struct Tasque {
+    inner: Arc<Inner>,
 }
 
-impl<S> Clone for Tasque<S> {
-    fn clone(&self) -> Self {
-        Self {
-            inner: self.inner.clone(),
-        }
-    }
-}
-
-impl<S: Send + Sync + 'static> Tasque<S> {
-    /// Starts building a `Tasque`. Handlers reach `state` through their [`Context`].
+impl Tasque {
+    /// Starts building a `Tasque`.
     #[allow(clippy::new_ret_no_self)]
-    pub fn new(store: impl Store, state: S) -> Builder<S> {
+    pub fn new(store: impl Store) -> Builder {
         Builder {
-            state,
             store: Box::new(store),
             handlers: HashMap::new(),
         }
@@ -153,22 +145,23 @@ impl<S: Send + Sync + 'static> Tasque<S> {
 }
 
 /// Registers handlers, then [`run`](Builder::run)s the [`Tasque`].
-pub struct Builder<S> {
-    state: S,
+pub struct Builder {
     store: Box<dyn Store>,
-    handlers: HashMap<TypeId, Handler<S>>,
+    handlers: HashMap<TypeId, Handler>,
 }
 
-impl<S: Send + Sync + 'static> Builder<S> {
-    /// Registers `handler` for jobs of type `I`.
+impl Builder {
+    /// Registers `handler` for jobs of type `I`. It reaches `state` through its
+    /// [`Context`].
     ///
     /// `name` identifies `I` in the store, so keep it stable once `I` is persisted.
     ///
     /// # Panics
     ///
     /// If another handler is registered under `name` or for `I`.
-    pub fn add<I, F, Fut, O>(mut self, name: &'static str, handler: F) -> Self
+    pub fn add<S, I, F, Fut, O>(mut self, name: &'static str, state: S, handler: F) -> Self
     where
+        S: Send + Sync + 'static,
         I: Clone + Serialize + DeserializeOwned + Send + 'static,
         F: Fn(Context<S>, I) -> Fut + Send + Sync + 'static,
         Fut: Future<Output = Result<O, BoxError>> + Send + 'static,
@@ -189,7 +182,8 @@ impl<S: Send + Sync + 'static> Builder<S> {
             TypeId::of::<I>(),
             Handler {
                 name,
-                invoker: Box::new(FunctionInvoker::<I, F, O> {
+                invoker: Box::new(FunctionInvoker::<S, I, F, O> {
+                    state: Arc::new(state),
                     f: handler,
                     _types: PhantomData,
                 }),
@@ -203,7 +197,7 @@ impl<S: Send + Sync + 'static> Builder<S> {
 
     /// Checks every [`Step::next`](crate::Step::next) type has a handler, then replays
     /// unfinished jobs from the store.
-    pub async fn run(self) -> Result<Tasque<S>, Error> {
+    pub async fn run(self) -> Result<Tasque, Error> {
         for handler in self.handlers.values() {
             if let Some((handler_type_id, handler_name)) = handler.next_handler {
                 if !self.handlers.contains_key(&handler_type_id) {
@@ -216,7 +210,6 @@ impl<S: Send + Sync + 'static> Builder<S> {
         }
 
         let inner = Arc::new(Inner {
-            ctx: self.state,
             store: self.store,
             handlers: self.handlers,
             sequence: AtomicU64::new(0),
@@ -232,9 +225,10 @@ impl<S: Send + Sync + 'static> Builder<S> {
     }
 }
 
-/// Passed to each handler run. Derefs to the state given to [`Tasque::new`].
+/// Passed to each handler run. Derefs to the state given to [`Builder::add`].
 pub struct Context<S> {
-    inner: Arc<Inner<S>>,
+    state: Arc<S>,
+    tasque: Tasque,
     attempt_count: u8,
 }
 
@@ -242,11 +236,11 @@ impl<S> Deref for Context<S> {
     type Target = S;
 
     fn deref(&self) -> &S {
-        &self.inner.ctx
+        &self.state
     }
 }
 
-impl<S: Send + Sync + 'static> Context<S> {
+impl<S> Context<S> {
     /// 0 on the first run, 1 on the first retry, and so on.
     pub fn attempt_count(&self) -> u8 {
         self.attempt_count
@@ -260,27 +254,22 @@ impl<S: Send + Sync + 'static> Context<S> {
         max_retries: Option<u8>,
         durable: bool,
     ) -> Result<(), Error> {
-        let ty = (TypeId::of::<T>(), type_name::<T>());
-        self.inner
-            .enqueue(ty, Box::new(job), priority, max_retries, durable)
-            .await
+        self.tasque.queue(job, priority, max_retries, durable).await
     }
 }
 
-struct Inner<S> {
-    /// The state handlers reach through their `Context`.
-    ctx: S,
+struct Inner {
     store: Box<dyn Store>,
-    handlers: HashMap<TypeId, Handler<S>>,
+    handlers: HashMap<TypeId, Handler>,
     sequence: AtomicU64,
     lifecycle: AtomicLifecycle,
     /// Woken whenever a slot frees up, for `shutdown`.
     idle: Notify,
 }
 
-struct Handler<S> {
+struct Handler {
     name: &'static str,
-    invoker: Box<dyn Invoker<S>>,
+    invoker: Box<dyn Invoker>,
     next_handler: Option<(TypeId, &'static str)>,
     queue: Mutex<HandlerQueue>,
 }
@@ -334,7 +323,7 @@ impl PartialEq for Job {
 
 impl Eq for Job {}
 
-impl<S: Send + Sync + 'static> Inner<S> {
+impl Inner {
     async fn enqueue(
         self: &Arc<Self>,
         (type_id, type_name): (TypeId, &'static str),
@@ -405,13 +394,12 @@ impl<S: Send + Sync + 'static> Inner<S> {
             return;
         }
 
-        let ctx = Context {
+        let tasque = Tasque {
             inner: self.clone(),
-            attempt_count: job.attempt,
         };
 
         // A separate task, so a panic fails the attempt without losing the slot.
-        let mut task = tokio::spawn(handler.invoker.invoke(ctx, &*job.payload));
+        let mut task = tokio::spawn(handler.invoker.invoke(tasque, job.attempt, &*job.payload));
         let result = match tokio::time::timeout(ATTEMPT_TIMEOUT, &mut task).await {
             Ok(Ok(result)) => result,
             Ok(Err(err)) => Err(err.into()),
@@ -545,7 +533,7 @@ impl<S: Send + Sync + 'static> Inner<S> {
 }
 
 /// Holds a slot: runs `job`, then the rest of its handler's line.
-async fn run_handler_slot<S: Send + Sync + 'static>(inner: Arc<Inner<S>>, mut job: Job) {
+async fn run_handler_slot(inner: Arc<Inner>, mut job: Job) {
     let type_id = job.type_id;
     loop {
         inner.run_attempt(job).await;
@@ -568,7 +556,7 @@ async fn run_handler_slot<S: Send + Sync + 'static>(inner: Arc<Inner<S>>, mut jo
 }
 
 /// Reclaims jobs from stopped processes every `CLAIM_INTERVAL`, until shutdown.
-async fn reclaim_loop<S: Send + Sync + 'static>(inner: Weak<Inner<S>>) {
+async fn reclaim_loop(inner: Weak<Inner>) {
     loop {
         tokio::time::sleep(RECLAIM_INTERVAL).await;
 
@@ -587,7 +575,7 @@ async fn reclaim_loop<S: Send + Sync + 'static>(inner: Weak<Inner<S>>) {
     }
 }
 
-fn to_record<S>(handler: &Handler<S>, job: &Job) -> Result<DurableJob, BoxError> {
+fn to_record(handler: &Handler, job: &Job) -> Result<DurableJob, BoxError> {
     Ok(DurableJob {
         id: job.id,
         handler_name: handler.name.to_string(),
@@ -612,18 +600,19 @@ fn retry_delay(attempt: u8) -> Duration {
 }
 
 /// A handler with its types erased, so one `Tasque` can hold them all.
-trait Invoker<S>: Send + Sync {
-    fn invoke(&self, ctx: Context<S>, value: &(dyn Any + Send)) -> HandlerFuture;
+trait Invoker: Send + Sync {
+    fn invoke(&self, tasque: Tasque, attempt_count: u8, value: &(dyn Any + Send)) -> HandlerFuture;
     fn encode(&self, value: &(dyn Any + Send)) -> Result<Vec<u8>, BoxError>;
     fn decode(&self, bytes: &[u8]) -> Result<ErasedJobPayload, BoxError>;
 }
 
-struct FunctionInvoker<I, F, O> {
+struct FunctionInvoker<S, I, F, O> {
+    state: Arc<S>,
     f: F,
     _types: PhantomData<fn(I) -> O>,
 }
 
-impl<S, I, F, Fut, O> Invoker<S> for FunctionInvoker<I, F, O>
+impl<S, I, F, Fut, O> Invoker for FunctionInvoker<S, I, F, O>
 where
     S: Send + Sync + 'static,
     I: Clone + Serialize + DeserializeOwned + Send + 'static,
@@ -631,7 +620,12 @@ where
     Fut: Future<Output = Result<O, BoxError>> + Send + 'static,
     O: IntoStep,
 {
-    fn invoke(&self, ctx: Context<S>, payload: &(dyn Any + Send)) -> HandlerFuture {
+    fn invoke(&self, tasque: Tasque, attempt_count: u8, payload: &(dyn Any + Send)) -> HandlerFuture {
+        let ctx = Context {
+            state: self.state.clone(),
+            tasque,
+            attempt_count,
+        };
         let input = downcast::<I>(payload).clone();
         let future = (self.f)(ctx, input);
         Box::pin(async move { future.await.map(IntoStep::into_handoff) })

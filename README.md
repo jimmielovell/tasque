@@ -19,12 +19,12 @@ struct Email { address: String, body: String }
 #[derive(Clone, Serialize, Deserialize)]
 struct Pdf { email_address: String, bytes: Vec<u8> }
 
-let tasque = Tasque::new(MokaStore::default(), clients)
-    .add("email", |ctx, Email { address, body }| async move {
-        ctx.postmark.send(&address, &body).await?;
+let tasque = Tasque::new(MokaStore::default())
+    .add("email", postmark, |ctx, Email { address, body }| async move {
+        ctx.send(&address, &body).await?;
         Ok(())
     })
-    .add("pdf", |_ctx, Pdf { email_address, bytes }| async move {
+    .add("pdf", (), |_ctx, Pdf { email_address, bytes }| async move {
         let body = extract_text(bytes)?;
         Ok(Step::next(Email { address: email_address, body }))
     })
@@ -34,7 +34,8 @@ let tasque = Tasque::new(MokaStore::default(), clients)
 tasque.queue(Email { address, body }, Priority::High, Some(3), false).await?;
 ```
 
-- `ctx` derefs to the state given to `Tasque::new`. It also has `ctx.attempt_count()` and `ctx.queue(..)`.
+- Each handler gets its own state, and `ctx` derefs to it. Pass the same `Arc` to several handlers to share one; pass `()` for none. `ctx` also has `ctx.attempt_count()` and `ctx.queue(..)`.
+- `Tasque` has no type parameters, so it can sit in your app state and be queued on from anywhere, e.g. `state.tasque.queue(..)` in an axum handler. Keep the `Tasque` itself out of handler state; use `ctx.queue(..)` instead.
 - Return `Ok(())` when done, or `Ok(Step::next(job))` to hand off to `job`'s handler.
 - The next job inherits priority, max_retries and durability unless overridden: `Step::next(job).priority(..).max_retries(..).durable()`.
 - `max_retries: None` means 3.

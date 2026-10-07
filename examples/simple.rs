@@ -40,13 +40,14 @@ async fn main() -> Result<(), tasque::Error> {
         sends: AtomicU32::new(0),
     };
 
-    let tasque = Tasque::new(MokaStore::default(), mailer)
-        .add("email", |ctx, Email { address, body }| async move {
+    let tasque = Tasque::new(MokaStore::default())
+        .add("email", mailer, |ctx, Email { address, body }| async move {
             ctx.send(&address, &body).await?;
             Ok(())
         })
         .add(
             "pdf",
+            (),
             |_ctx,
              Pdf {
                  email_address,
