@@ -60,8 +60,8 @@ async fn main() -> Result<(), tasque::Error> {
                 }))
             },
         )
-        .run()
-        .await?;
+        .build()?;
+    tasque.run().await?;
 
     let welcome = Email {
         address: "new@example.com".into(),

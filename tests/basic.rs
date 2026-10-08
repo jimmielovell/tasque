@@ -117,9 +117,9 @@ async fn tasque() -> (Tasque, Arc<State>) {
             panic!("handler panicked");
             Ok(())
         })
-        .run()
-        .await
+        .build()
         .unwrap();
+    t.run().await.unwrap();
     (t, state)
 }
 
@@ -313,9 +313,9 @@ async fn a_handler_can_queue_more_jobs() {
             }
             Ok(())
         })
-        .run()
-        .await
+        .build()
         .unwrap();
+    t.run().await.unwrap();
 
     let fanout = Fanout(vec!["a@example.com".into(), "b@example.com".into()]);
     t.queue(fanout, Priority::Medium, None, false)
@@ -342,9 +342,9 @@ async fn each_handler_gets_its_own_state() {
                 body: String::from_utf8(bytes)?,
             }))
         })
-        .run()
-        .await
+        .build()
         .unwrap();
+    t.run().await.unwrap();
 
     let pdf = Pdf {
         email_address: "a@example.com".into(),
@@ -384,8 +384,7 @@ async fn start_fails_when_a_next_step_has_no_handler() {
                 }))
             },
         )
-        .run()
-        .await;
+        .build();
 
     let Err(err) = result else {
         panic!("start should fail");

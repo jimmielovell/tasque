@@ -77,9 +77,9 @@ async fn tasque(store: Arc<MokaStore>, emails: Emails) -> (Tasque, Arc<State>) {
         .add("fails", (), |_ctx, Fails| async move {
             Err::<(), BoxError>("always".into())
         })
-        .run()
-        .await
+        .build()
         .unwrap();
+    t.run().await.unwrap();
     (t, state)
 }
 
@@ -321,9 +321,9 @@ async fn queue_fails_when_the_store_does() {
             ctx.sent.lock().unwrap().push(address);
             Ok(())
         })
-        .run()
-        .await
+        .build()
         .unwrap();
+    t.run().await.unwrap();
 
     let err = t
         .queue(email("a@example.com"), Priority::Medium, None, true)
@@ -381,9 +381,9 @@ async fn a_next_step_the_store_refuses_does_not_hold_back_the_one_before() {
             ctx.pdfs.fetch_add(1, Ordering::SeqCst);
             Ok(Step::next(Email { address }))
         })
-        .run()
-        .await
+        .build()
         .unwrap();
+    t.run().await.unwrap();
 
     let pdf = Pdf {
         address: "b@example.com".into(),
@@ -437,9 +437,9 @@ async fn a_job_claimed_by_another_process_is_not_retried_here() {
             ctx.pdfs.fetch_add(1, Ordering::SeqCst);
             Err::<(), BoxError>("always".into())
         })
-        .run()
-        .await
+        .build()
         .unwrap();
+    t.run().await.unwrap();
 
     t.queue(Fails, Priority::Medium, Some(5), true)
         .await

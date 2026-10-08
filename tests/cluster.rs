@@ -112,34 +112,35 @@ impl Process {
                 process: name,
                 ledger,
             });
-            Tasque::new(store)
-            .add("job", ctx.clone(), |ctx, Job { id, kind }| async move {
-                let attempt = ctx.attempt_count();
-                ctx.ledger
-                    .runs
-                    .lock()
-                    .unwrap()
-                    .push((id, ctx.process, attempt));
-                let ms = if kind == Kind::Slow { 3000 } else { 300 };
-                tokio::time::sleep(Duration::from_millis(ms)).await;
-                match kind {
-                    Kind::Broken => Err("broken".into()),
-                    Kind::Flaky if attempt < 2 => Err("flaky".into()),
-                    Kind::Chain => Ok(Step::next(FollowUp { id })),
-                    _ => {
-                        ctx.ledger.complete(id);
-                        Ok(Step::done())
+            let tasque = Tasque::new(store)
+                .add("job", ctx.clone(), |ctx, Job { id, kind }| async move {
+                    let attempt = ctx.attempt_count();
+                    ctx.ledger
+                        .runs
+                        .lock()
+                        .unwrap()
+                        .push((id, ctx.process, attempt));
+                    let ms = if kind == Kind::Slow { 3000 } else { 300 };
+                    tokio::time::sleep(Duration::from_millis(ms)).await;
+                    match kind {
+                        Kind::Broken => Err("broken".into()),
+                        Kind::Flaky if attempt < 2 => Err("flaky".into()),
+                        Kind::Chain => Ok(Step::next(FollowUp { id })),
+                        _ => {
+                            ctx.ledger.complete(id);
+                            Ok(Step::done())
+                        }
                     }
-                }
-            })
-            .add("follow_up", ctx, |ctx, FollowUp { id }| async move {
-                tokio::time::sleep(Duration::from_millis(300)).await;
-                ctx.ledger.complete(id);
-                Ok(())
-            })
-            .run()
-            .await
-            .unwrap()
+                })
+                .add("follow_up", ctx, |ctx, FollowUp { id }| async move {
+                    tokio::time::sleep(Duration::from_millis(300)).await;
+                    ctx.ledger.complete(id);
+                    Ok(())
+                })
+                .build()
+                .unwrap();
+            tasque.run().await.unwrap();
+            tasque
         });
         println!("{name}: started");
         Self {

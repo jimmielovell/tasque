@@ -103,6 +103,17 @@ impl Tasque {
             .await
     }
 
+    /// Replays unfinished jobs from the store.
+    pub async fn run(&self) -> Result<(), Error> {
+        let recovered = self.inner.store.reclaim_stale().await.map_err(Error::Store)?;
+        self.inner.restore_jobs(recovered);
+        let inner = self.inner.clone();
+
+        tokio::spawn(reclaim_loop(Arc::downgrade(&inner)));
+
+        Ok(())
+    }
+
     /// Stops taking jobs, waits for running attempts, then releases the store's
     /// unfinished jobs to other processes.
     ///
@@ -144,7 +155,7 @@ impl Tasque {
     }
 }
 
-/// Registers handlers, then [`run`](Builder::run)s the [`Tasque`].
+/// Registers handlers, then [`build`](Builder::build)s the [`Tasque`].
 pub struct Builder {
     store: Box<dyn Store>,
     handlers: HashMap<TypeId, Handler>,
@@ -195,9 +206,9 @@ impl Builder {
         self
     }
 
-    /// Checks every [`Step::next`](crate::Step::next) type has a handler, then replays
-    /// unfinished jobs from the store.
-    pub async fn run(self) -> Result<Tasque, Error> {
+    /// Checks every [`Step::next`](crate::Step::next) type has a handler,
+    /// then builds `Tasque`.
+    pub fn build(self) -> Result<Tasque, Error> {
         for handler in self.handlers.values() {
             if let Some((handler_type_id, handler_name)) = handler.next_handler {
                 if !self.handlers.contains_key(&handler_type_id) {
@@ -216,10 +227,6 @@ impl Builder {
             lifecycle: AtomicLifecycle::new(Lifecycle::Running),
             idle: Notify::new(),
         });
-
-        let recovered = inner.store.reclaim_stale().await.map_err(Error::Store)?;
-        inner.restore_jobs(recovered);
-        tokio::spawn(reclaim_loop(Arc::downgrade(&inner)));
 
         Ok(Tasque { inner })
     }

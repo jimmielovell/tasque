@@ -187,9 +187,9 @@ async fn mailer(
             ctx.lock().unwrap().push(address);
             Ok(())
         })
-        .run()
-        .await
+        .build()
         .unwrap();
+    t.run().await.unwrap();
     (t, sent)
 }
 

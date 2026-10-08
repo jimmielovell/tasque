@@ -28,8 +28,8 @@ let tasque = Tasque::new(MokaStore::default())
         let body = extract_text(bytes)?;
         Ok(Step::next(Email { address: email_address, body }))
     })
-    .run()
-    .await?;
+    .build()?;
+tasque.run().await?;
 
 tasque.queue(Email { address, body }, Priority::High, Some(3), false).await?;
 ```
@@ -39,7 +39,7 @@ tasque.queue(Email { address, body }, Priority::High, Some(3), false).await?;
 - Return `Ok(())` when done, or `Ok(Step::next(job))` to hand off to `job`'s handler.
 - The next job inherits priority, max_retries and durability unless overridden: `Step::next(job).priority(..).max_retries(..).durable()`.
 - `max_retries: None` means 3.
-- `run` checks every `Step::next` type has a handler, then replays stored jobs.
+- `build` checks every `Step::next` type has a handler. `run` then replays unfinished stored jobs and starts reclaiming those of stopped processes; call it when this process should start picking them up.
 
 ## How jobs run
 

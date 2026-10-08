@@ -3,7 +3,7 @@ use std::sync::atomic::{AtomicUsize, Ordering};
 use std::sync::{Arc, Mutex};
 use std::time::Duration;
 use tasque::{MokaStore, Priority, Step, Tasque};
-use tokio::time::{Instant, sleep};
+use tokio::time::{sleep, Instant};
 
 #[derive(Clone, Serialize, Deserialize)]
 struct Work {
@@ -82,9 +82,10 @@ async fn tasque() -> (Tasque, Arc<State>) {
             *ctx.email_after.lock().unwrap() = Some(ctx.began.elapsed());
             Ok(())
         })
-        .run()
-        .await
+        .build()
         .unwrap();
+
+    t.run().await.unwrap();
     (t, state)
 }
 

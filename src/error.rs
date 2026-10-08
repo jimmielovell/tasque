@@ -4,7 +4,7 @@ use std::fmt;
 /// `&str` or `String` into it.
 pub type BoxError = Box<dyn std::error::Error + Send + Sync + 'static>;
 
-/// Why [`Tasque::queue`](crate::Tasque::queue) or [`Builder::run`](crate::Builder::run) failed.
+/// Why [`Tasque::queue`](crate::Tasque::queue) or [`Builder::build`](crate::Builder::build) or [`Tasque::run`](crate::Tasque::run) failed.
 #[derive(Debug)]
 #[non_exhaustive]
 pub enum Error {
